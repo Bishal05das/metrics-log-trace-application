@@ -1,0 +1,25 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # A FIXED uid is the important part. Dashboard JSON references its
+    # datasource by uid, so if Grafana generates a random one on each install
+    # your committed dashboards point at a datasource that does not exist and
+    # every panel shows "Datasource not found". Pin it, and reference this
+    # exact string from every dashboard.
+    uid: prometheus
+    # Service name on the compose network, and the INTERNAL port (9090), not
+    # the published one (9095). Grafana talks to Prometheus container-to-
+    # container; the host port mapping is irrelevant here.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Lets Grafana pick sensible step sizes and warn about queries that would
+      # return absurd numbers of points.
+      timeInterval: 5s
+      httpMethod: POST
+      prometheusType: Prometheus
+      prometheusVersion: 3.1.0

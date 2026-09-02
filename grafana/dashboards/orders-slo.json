@@ -1,0 +1,309 @@
+{
+  "uid": "orders-slo",
+  "title": "Orders — SLO & Error Budget",
+  "tags": ["orders", "slo"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "type": "text",
+      "title": "The model",
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "**SLO:** 99% of requests succeed (non-5xx), and 99% complete under 250ms.\n\n**Error budget:** 1% over 30 days ≈ 7h 12m of total failure, or a small amount of failure spread out.\n\n**Burn rate** is how fast you are spending it. Rate 1 exhausts the budget exactly at the end of the window. Rate 14.4 exhausts it in about 2 days — that is a page. Rate 6 takes about 5 days — that is a ticket.\n\nEach burn alert requires a **long AND a short window** to both breach: the long window is stable but slow to fire *and slow to resolve*; the short window is fast both ways but alone fires on every blip. Requiring both gives fast detection and fast reset."
+      }
+    },
+    {
+      "type": "gauge",
+      "title": "Availability budget remaining (6h)",
+      "description": "1 - (observed error ratio / 0.01). Below zero means you have overspent the budget for this window.",
+      "gridPos": { "h": 7, "w": 6, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "clamp_min(1 - (job:orders_slo_availability_errors:ratio_rate6h / 0.01), 0)",
+          "legendFormat": "budget left"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.25 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "type": "gauge",
+      "title": "Latency budget remaining (6h)",
+      "gridPos": { "h": 7, "w": 6, "x": 6, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "clamp_min(1 - (job:orders_slo_latency_errors:ratio_rate6h / 0.01), 0)",
+          "legendFormat": "budget left"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.25 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "type": "stat",
+      "title": "Availability (6h)",
+      "gridPos": { "h": 7, "w": 6, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - job:orders_slo_availability_errors:ratio_rate6h",
+          "legendFormat": "success ratio"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0.99 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "graphMode": "area",
+        "colorMode": "value"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Requests under 250ms (6h)",
+      "description": "Read straight from the le=\"0.25\" bucket. Phase 2 put a boundary exactly on the SLO threshold so this number is measured, not interpolated — otherwise you would be reporting a guess to customers.",
+      "gridPos": { "h": 7, "w": 6, "x": 18, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - job:orders_slo_latency_errors:ratio_rate6h",
+          "legendFormat": "fast ratio"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0.99 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "graphMode": "area",
+        "colorMode": "value"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Multi-window burn rate",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Availability burn rate",
+      "description": "Both the long and short window must cross a threshold for the corresponding alert to fire. Where the two lines diverge, you are looking at either a blip (short only) or a stale condition (long only).",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "job:orders_slo_availability_errors:ratio_rate5m / 0.01", "legendFormat": "5m window" },
+        { "refId": "B", "expr": "job:orders_slo_availability_errors:ratio_rate30m / 0.01", "legendFormat": "30m window" },
+        { "refId": "C", "expr": "job:orders_slo_availability_errors:ratio_rate1h / 0.01", "legendFormat": "1h window" },
+        { "refId": "D", "expr": "job:orders_slo_availability_errors:ratio_rate6h / 0.01", "legendFormat": "6h window" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "transparent", "value": null },
+              { "color": "orange", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          },
+          "custom.thresholdsStyle": { "mode": "dashed" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency burn rate",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "job:orders_slo_latency_errors:ratio_rate5m / 0.01", "legendFormat": "5m window" },
+        { "refId": "B", "expr": "job:orders_slo_latency_errors:ratio_rate30m / 0.01", "legendFormat": "30m window" },
+        { "refId": "C", "expr": "job:orders_slo_latency_errors:ratio_rate1h / 0.01", "legendFormat": "1h window" },
+        { "refId": "D", "expr": "job:orders_slo_latency_errors:ratio_rate6h / 0.01", "legendFormat": "6h window" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "transparent", "value": null },
+              { "color": "orange", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          },
+          "custom.thresholdsStyle": { "mode": "dashed" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Alert state",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Firing alerts",
+      "description": "ALERTS is a synthetic series Prometheus generates for every pending or firing alert. Note this is Prometheus's raw view — Alertmanager's inhibition rules mean far fewer notifications are actually delivered.",
+      "gridPos": { "h": 8, "w": 14, "x": 0, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (alertname, severity) (ALERTS{alertstate=\"firing\"})",
+          "legendFormat": "{{severity}} — {{alertname}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 30, "showPoints": "never", "stacking": { "mode": "normal", "group": "A" } }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "table",
+      "title": "Currently pending or firing",
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "ALERTS", "instant": true, "format": "table" }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "Value": true, "job": true, "__name__": true, "instance": true, "cluster": true, "env": true, "service": true },
+            "renameByName": { "alertname": "Alert", "alertstate": "State", "severity": "Severity", "slo": "SLO" }
+          }
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": { "showHeader": true }
+    },
+    {
+      "type": "timeseries",
+      "title": "Is alert DELIVERY healthy?",
+      "description": "If the notification path is broken, every alert fires into the void and nothing tells you. This is the alert about your alerts.",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(alertmanager_notifications_total{integration=\"webhook\"}[5m]))",
+          "legendFormat": "sent/s"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (reason) (rate(alertmanager_notifications_failed_total{integration=\"webhook\"}[5m])) > 0",
+          "legendFormat": "FAILED ({{reason}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "showPoints": "auto" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "FAILED.*" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    }
+  ]
+}

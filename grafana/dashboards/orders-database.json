@@ -1,0 +1,268 @@
+{
+  "uid": "orders-database",
+  "title": "Orders — Database (USE)",
+  "tags": ["orders", "database", "use"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "type": "text",
+      "title": "How to read this dashboard",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Query time vs acquire wait is the whole point of this page.**\n\n- `query_duration` high, `acquire_wait` low → **the database is slow.** Fix the query or the index.\n- `query_duration` low, `acquire_wait` high → **you are out of connections.** Fix the pool size or find what is holding connections.\n\nBoth look identical from the outside (\"the API got slow\"), and teams routinely spend a day optimising a query that was never the problem."
+      }
+    },
+    {
+      "type": "row",
+      "title": "Utilisation",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 4 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Pool connections by state",
+      "description": "acquired + idle + constructing. Pinned at max with zero idle means every request is queueing.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "orders_db_pool_connections", "legendFormat": "{{state}}" },
+        { "refId": "B", "expr": "orders_db_pool_max_connections", "legendFormat": "max" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "showPoints": "never" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "max" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 6] } }
+            ]
+          },
+          { "matcher": { "id": "byName", "options": "acquired" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }] },
+          { "matcher": { "id": "byName", "options": "idle" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }] }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "gauge",
+      "title": "Pool utilisation",
+      "description": "acquired / max. 100% utilisation with zero wait is healthy — it means you sized the pool well. Utilisation alone is not a problem signal; saturation is.",
+      "gridPos": { "h": 8, "w": 5, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "job:orders_db_pool_utilisation:ratio", "legendFormat": "utilisation" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.8 },
+              { "color": "red", "value": 0.95 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "type": "stat",
+      "title": "Waited for a connection",
+      "description": "Fraction of acquisitions that found the pool empty. Above zero for any sustained period means you are undersized.",
+      "gridPos": { "h": 8, "w": 7, "x": 17, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "job:orders_db_pool_empty_acquire:ratio_rate5m", "legendFormat": "empty acquires" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.01 },
+              { "color": "red", "value": 0.1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "graphMode": "area",
+        "colorMode": "value"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Saturation — the signal that separates two different problems",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Connection acquire wait (p99)",
+      "description": "On a healthy pool this is microseconds — you are taking an idle connection off a channel. Anything above ~1ms means you waited for someone else to finish.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "job:orders_db_pool_acquire_wait_seconds:p99_5m", "legendFormat": "p99 acquire wait" },
+        {
+          "refId": "B",
+          "expr": "rate(orders_db_pool_acquire_seconds_total[5m]) / clamp_min(rate(orders_db_pool_acquires_total[5m]), 1e-9)",
+          "legendFormat": "mean acquire wait"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "transparent", "value": null },
+              { "color": "red", "value": 0.05 }
+            ]
+          },
+          "custom.thresholdsStyle": { "mode": "dashed" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Query execution time by named query",
+      "description": "Compare against acquire wait on the left. During the Phase 3 saturation experiment these lines stayed FLAT while acquire wait rose 100,000x.",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "job_query:orders_db_query_duration_seconds:mean5m{status=\"ok\"} > 0",
+          "legendFormat": "{{query}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Errors and lifecycle",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Query errors by SQLSTATE",
+      "description": "PostgreSQL error codes are a closed set, which makes them safe as labels and far more actionable than a boolean: 23505 is a client bug, 40001 means retry, 53300 is infrastructure.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (query, kind) (rate(orders_db_query_errors_total[5m])) > 0",
+          "legendFormat": "{{query}} / {{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 20, "showPoints": "auto" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Abandoned acquisitions",
+      "description": "Callers who gave up while queued for a connection. This is your error budget burning, and it appears nowhere in query metrics.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "rate(orders_db_pool_canceled_acquires_total[5m])", "legendFormat": "canceled/s" },
+        { "refId": "B", "expr": "rate(orders_db_pool_acquire_errors_total[5m])", "legendFormat": "errors/s" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 20, "showPoints": "never" },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Connection churn",
+      "description": "Every new connection costs a TCP handshake, TLS negotiation and auth round trip. High churn means your idle timeout or max lifetime is too aggressive.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "rate(orders_db_pool_new_connections_total[5m])", "legendFormat": "opened/s" },
+        {
+          "refId": "B",
+          "expr": "sum by (reason) (rate(orders_db_pool_connections_destroyed_total[5m]))",
+          "legendFormat": "closed/s ({{reason}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    }
+  ]
+}

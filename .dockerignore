@@ -1,0 +1,16 @@
+# Everything here is excluded from the build context. A smaller context means
+# faster builds and fewer accidental cache invalidations.
+bin/
+.git/
+.env
+*.out
+
+# Config for the observability stack — mounted into their own containers at
+# runtime, never needed inside the app image.
+prometheus/
+alertmanager/
+grafana/
+scripts/
+docker-compose.yml
+Makefile
+README.md

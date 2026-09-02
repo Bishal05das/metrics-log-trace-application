@@ -1,0 +1,17 @@
+apiVersion: 1
+
+providers:
+  - name: orders
+    orgId: 1
+    folder: Orders
+    type: file
+    # Dashboards are read-only in the UI. You CAN still edit and explore, but
+    # "Save" is disabled — changes must go through the JSON in git. That is the
+    # point of provisioning: the dashboard someone fixed at 3am survives the
+    # next container restart because it was committed, not clicked.
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 15
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

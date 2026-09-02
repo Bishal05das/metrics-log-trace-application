@@ -1,0 +1,288 @@
+# Alerting rules.
+#
+# The guiding principle, and the one most alert sets violate: ALERT ON SYMPTOMS
+# THE USER FEELS, not on causes. "p99 latency is 3s" is a symptom — always worth
+# waking someone for. "CPU is at 90%" is a cause; if nothing is actually slow,
+# it is not an incident, it is a fact. Cause-based alerts are how teams end up
+# with 200 rules nobody trusts.
+#
+# Every rule here carries:
+#   for:         how long the condition must hold. Without it you page on a
+#                single bad scrape, and your alerts flap.
+#   severity:    routes the notification (see alertmanager.yml).
+#   summary:     one line, shown in the notification title.
+#   description: the numbers, templated, so the page itself tells you the scale.
+#   runbook_url: what to DO. An alert without a runbook is a puzzle handed to
+#                someone at 3am.
+
+groups:
+  # ---------------------------------------------------------------------------
+  - name: orders_availability
+    rules:
+      # The most important alert in any system, and the one people forget:
+      # fires when the target STOPS BEING SCRAPED. Threshold alerts cannot fire
+      # if there is no data — a crashed process makes every other rule here go
+      # silent, not red.
+      - alert: OrdersTargetDown
+        expr: up{job="orders-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: "orders-api target {{ $labels.instance }} is down"
+          description: "Prometheus has been unable to scrape {{ $labels.instance }} for over 1 minute. Every other orders alert is blind while this is firing."
+          runbook_url: "https://runbooks.internal/orders/target-down"
+
+      # The complementary case: the target is UP but a metric has vanished —
+      # someone deleted the instrumentation, or a code path stopped executing.
+      # absent() is the only way to alert on a metric that does not exist,
+      # because a selector matching nothing produces no series to compare.
+      - alert: OrdersRequestMetricMissing
+        expr: absent(orders_http_requests_total{job="orders-api"})
+        for: 5m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: "orders_http_requests_total has disappeared"
+          description: "The target is up but is no longer exposing request metrics. Instrumentation was likely removed or renamed in a deploy."
+          runbook_url: "https://runbooks.internal/orders/metric-missing"
+
+      - alert: OrdersHighErrorRate
+        expr: job:orders_http_error_ratio:rate5m > 0.05
+        for: 2m
+        # keep_firing_for stops the alert resolving the instant the ratio dips
+        # below the threshold. Without it, a condition oscillating around the
+        # line produces a stream of firing/resolved pairs — the fastest way to
+        # train a team to ignore your alerts.
+        keep_firing_for: 5m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: "orders-api 5xx rate is {{ $value | humanizePercentage }}"
+          description: "5xx responses are {{ $value | humanizePercentage }} of traffic over the last 5m, against a 5% threshold."
+          runbook_url: "https://runbooks.internal/orders/high-error-rate"
+
+      - alert: OrdersHighLatency
+        expr: job_route:orders_http_request_duration_seconds:p99_5m > 0.25
+        for: 3m
+        labels:
+          severity: warning
+          service: orders
+        annotations:
+          summary: "p99 latency on {{ $labels.route }} is {{ $value | humanizeDuration }}"
+          description: "99th percentile latency for {{ $labels.route }} is {{ $value | humanizeDuration }}, above the 250ms objective."
+          runbook_url: "https://runbooks.internal/orders/high-latency"
+
+      - alert: OrdersHandlerPanics
+        expr: increase(orders_http_panics_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: "handler panic on {{ $labels.route }}"
+          description: "{{ $value | printf \"%.0f\" }} panic(s) recovered on {{ $labels.route }} in the last 5m. Any panic in production is a bug."
+          runbook_url: "https://runbooks.internal/orders/panic"
+
+  # ---------------------------------------------------------------------------
+  # Multi-window, multi-burn-rate SLO alerts.
+  #
+  # This is what Google's SRE workbook actually recommends and what almost
+  # nobody implements. The idea:
+  #
+  # An SLO of 99% availability over 30 days gives you an ERROR BUDGET of 1%.
+  # "Burn rate" is how fast you are spending it: burn rate 1 exhausts the
+  # budget exactly at the end of the window; burn rate 14.4 exhausts it in
+  # 30d/14.4 ≈ 2 days.
+  #
+  # Why TWO windows per alert? Each solves the other's flaw:
+  #   - The LONG window (1h) is stable but slow to fire and, worse, slow to
+  #     RESOLVE — it keeps the alert active long after the incident ended.
+  #   - The SHORT window (5m) is fast and resolves promptly, but alone it
+  #     fires on every transient blip.
+  # Requiring both to breach gives fast detection AND fast reset.
+  #
+  # Why TWO alerts at different rates? Severity should follow urgency:
+  #   - Burning 14.4x means you exhaust a month's budget in 2 days. Page now.
+  #   - Burning 6x means you exhaust it in 5 days. A ticket is enough.
+  # ---------------------------------------------------------------------------
+  - name: orders_slo_burn
+    rules:
+      # 99% availability SLO → 1% error budget.
+      # 14.4 × 0.01 = 0.144 → 14.4% error rate sustained.
+      - alert: OrdersAvailabilityBudgetBurnFast
+        expr: |
+          job:orders_slo_availability_errors:ratio_rate1h > (14.4 * 0.01)
+          and
+          job:orders_slo_availability_errors:ratio_rate5m > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: critical
+          service: orders
+          slo: availability
+        annotations:
+          summary: "burning availability budget 14.4x — 30d budget gone in ~2 days"
+          description: "5xx ratio is {{ $value | humanizePercentage }} over both 1h and 5m windows. At this rate the 30-day error budget is exhausted in about 2 days."
+          runbook_url: "https://runbooks.internal/orders/slo-burn"
+
+      # 6 × 0.01 = 0.06 → 6% error rate sustained. Budget gone in ~5 days.
+      - alert: OrdersAvailabilityBudgetBurnSlow
+        expr: |
+          job:orders_slo_availability_errors:ratio_rate6h > (6 * 0.01)
+          and
+          job:orders_slo_availability_errors:ratio_rate30m > (6 * 0.01)
+        for: 15m
+        labels:
+          severity: warning
+          service: orders
+          slo: availability
+        annotations:
+          summary: "burning availability budget 6x — 30d budget gone in ~5 days"
+          description: "5xx ratio is {{ $value | humanizePercentage }} over both 6h and 30m windows."
+          runbook_url: "https://runbooks.internal/orders/slo-burn"
+
+      # 99% of requests under 250ms → 1% may be slower.
+      - alert: OrdersLatencyBudgetBurnFast
+        expr: |
+          job:orders_slo_latency_errors:ratio_rate1h > (14.4 * 0.01)
+          and
+          job:orders_slo_latency_errors:ratio_rate5m > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: critical
+          service: orders
+          slo: latency
+        annotations:
+          summary: "burning latency budget 14.4x"
+          description: "{{ $value | humanizePercentage }} of requests are slower than 250ms across both 1h and 5m windows."
+          runbook_url: "https://runbooks.internal/orders/slo-burn"
+
+  # ---------------------------------------------------------------------------
+  - name: orders_database
+    rules:
+      # The alert that would have caught the Phase 3 experiment, where every
+      # query metric looked healthy and users saw 1.15s responses.
+      - alert: OrdersDBPoolSaturated
+        expr: job:orders_db_pool_acquire_wait_seconds:p99_5m > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: "database pool saturated — p99 acquire wait {{ $value | humanizeDuration }}"
+          description: "Requests are queueing for a database connection ({{ $value | humanizeDuration }} at p99). Query execution time is NOT the problem — check pool size and long-held connections."
+          runbook_url: "https://runbooks.internal/orders/db-pool-saturated"
+
+      - alert: OrdersDBPoolNearCapacity
+        expr: job:orders_db_pool_utilisation:ratio > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          service: orders
+        annotations:
+          summary: "database pool {{ $value | humanizePercentage }} utilised"
+          description: "Sustained high utilisation. Healthy on its own, but you have no headroom for a traffic spike."
+          runbook_url: "https://runbooks.internal/orders/db-pool-capacity"
+
+      - alert: OrdersDBQueryErrors
+        expr: sum by (job, query, kind) (rate(orders_db_query_errors_total[5m])) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+          service: orders
+        annotations:
+          summary: "database errors on {{ $labels.query }} (SQLSTATE {{ $labels.kind }})"
+          description: "{{ $labels.query }} is failing at {{ $value | printf \"%.2f\" }}/s with SQLSTATE {{ $labels.kind }}."
+          runbook_url: "https://runbooks.internal/orders/db-errors"
+
+  # ---------------------------------------------------------------------------
+  # Background work. Nobody is waiting on a socket, so none of these failures
+  # show up as errors or latency anywhere else — the worker just stops.
+  # ---------------------------------------------------------------------------
+  - name: orders_worker
+    rules:
+      # The heartbeat. This fires even when there is no work to do, because
+      # idle ticks are recorded as result="empty" — which is exactly why that
+      # distinction was worth making in Phase 4.
+      - alert: OrdersWorkerStopped
+        expr: sum by (job) (rate(orders_worker_runs_total[5m])) == 0
+        for: 3m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: "order worker has stopped running"
+          description: "No worker iterations in 5 minutes. Orders will accumulate in `pending` and no HTTP metric will show it."
+          runbook_url: "https://runbooks.internal/orders/worker-stopped"
+
+      # Age, not length. A big queue that drains fast is fine; a small one
+      # where the oldest item is an hour old is an incident.
+      - alert: OrdersBacklogAgeHigh
+        expr: orders_backlog_oldest_age_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+          service: orders
+        annotations:
+          summary: "oldest pending order is {{ $value | humanizeDuration }} old"
+          description: "The oldest unprocessed order has been waiting {{ $value | humanizeDuration }}, above the 5m threshold."
+          runbook_url: "https://runbooks.internal/orders/backlog-age"
+
+      # Alerting on the FRESHNESS of a metric, not its value.
+      #
+      # orders_backlog_* are cached gauges refreshed on a 15s ticker. If that
+      # refresher dies, the gauges freeze at their last plausible value and
+      # every backlog alert above goes quietly, permanently green. This is the
+      # price of not querying at scrape time, and this alert is how you pay it.
+      - alert: OrdersBacklogMetricsStale
+        expr: time() - orders_backlog_last_refresh_timestamp_seconds > 90
+        for: 2m
+        labels:
+          severity: warning
+          service: orders
+        annotations:
+          summary: "backlog metrics are {{ $value | humanizeDuration }} stale"
+          description: "The backlog refresher has not updated in {{ $value | humanizeDuration }}. Backlog gauges are frozen and the alerts based on them are blind."
+          runbook_url: "https://runbooks.internal/orders/backlog-stale"
+
+      - alert: OrdersPaymentFailureRateHigh
+        expr: job:orders_payment_failure:ratio_rate5m > 0.25
+        for: 5m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: "payment failure rate is {{ $value | humanizePercentage }}"
+          description: "{{ $value | humanizePercentage }} of orders are failing payment, against a ~8% baseline. Every technical metric can be green while this fires."
+          runbook_url: "https://runbooks.internal/orders/payment-failures"
+
+  # ---------------------------------------------------------------------------
+  - name: orders_runtime
+    rules:
+      - alert: OrdersFileDescriptorsExhausting
+        expr: process_open_fds{job="orders-api"} / process_max_fds{job="orders-api"} > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          service: orders
+        annotations:
+          summary: "file descriptors {{ $value | humanizePercentage }} used"
+          description: "The process is approaching its FD limit and will start refusing connections."
+          runbook_url: "https://runbooks.internal/orders/fd-exhaustion"
+
+      # A goroutine leak is a slow death: memory climbs, then OOMKill. The
+      # absolute threshold is service-specific — set it well above your normal
+      # peak, then tighten it once you know the real shape.
+      - alert: OrdersGoroutineLeak
+        expr: go_goroutines{job="orders-api"} > 2000
+        for: 10m
+        labels:
+          severity: warning
+          service: orders
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} goroutines — possible leak"
+          description: "Goroutine count has been above 2000 for 10 minutes. Usually a missing context cancellation or an unclosed response body."
+          runbook_url: "https://runbooks.internal/orders/goroutine-leak"

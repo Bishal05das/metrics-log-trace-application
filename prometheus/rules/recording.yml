@@ -1,0 +1,246 @@
+# Recording rules pre-compute expressions on a schedule and store the result as
+# a new series.
+#
+# Three reasons they exist, in order of importance:
+#
+#   1. CONSISTENCY. Your dashboard, your alert and your SLO report should all
+#      agree on what "error rate" means. If each re-types the expression, they
+#      will drift, and you will eventually have an alert firing against a
+#      dashboard that shows green. Define it once, here.
+#   2. COST. histogram_quantile over 90 bucket series across a 6h window is
+#      expensive. Evaluated once every 15s and stored, it is free to query.
+#   3. LONG WINDOWS. A 30-day SLO query over raw data may not finish. Over
+#      pre-recorded 5m series it is trivial.
+#
+# NAMING: level:metric:operations — the Prometheus convention.
+#   level      the labels the result is aggregated to (job, or job_route)
+#   metric     what is being measured
+#   operations what was done to it, innermost last (rate5m, ratio, p99)
+#
+# Following it strictly is worth the pedantry: the name alone tells you the
+# result's label set, which is what you need to know to join it to anything.
+#
+# ---------------------------------------------------------------------------
+# A NOTE ON DIVISION, because it bit this file once already.
+#
+# Every ratio here divides two rates, and when traffic stops both are 0. The
+# tempting guard is `(a / b) or vector(0)`, which is WRONG in two ways:
+#
+#   1. `or` substitutes when the left side has NO SERIES. `0/0` produces a
+#      series whose VALUE is NaN — the series exists, so `or` never fires and
+#      the NaN sails straight through.
+#   2. When `or vector(0)` does fire, vector(0) has NO LABELS. You get a
+#      phantom `metric{}` series alongside your real `metric{job="..."}` one.
+#      It will not match any `by (job)` aggregation or any join, and it sits in
+#      your TSDB forever looking like real data.
+#
+# The correct guard is clamp_min on the DENOMINATOR: it cannot produce NaN,
+# preserves the label set exactly, and when there is genuinely no traffic the
+# expression returns no series at all — which is the honest answer. "No
+# requests" is not an error ratio of zero; it is an absence, and
+# OrdersTargetDown / OrdersRequestMetricMissing are the alerts that cover it.
+#
+# There is a THIRD failure, and it is the subtlest of the three. An error ratio
+# selects `{status_class="5xx"}` in the numerator. On a healthy service that
+# selector matches NO SERIES AT ALL — not a series holding zero, nothing. And
+# `no series / anything` is no series, so the whole ratio silently vanishes
+# exactly while the service is behaving perfectly. Your error-budget panel is
+# blank until your first 500, which is precisely backwards.
+#
+# The fix is an `or` fallback that PRESERVES LABELS:
+#
+#     sum by (job) (rate(total{status_class="5xx"}[5m]))
+#     or
+#     sum by (job) (rate(total[5m]) * 0)
+#
+# This is the correct use of `or` — it substitutes when the left has no series,
+# which is the real condition here — and multiplying the full selector by zero
+# yields a genuine zero carrying the same `job` label. Contrast `or vector(0)`,
+# which substitutes a LABELLESS series and poisons every later aggregation.
+#
+# Note which rules below do NOT need this: orders_payment_failure divides by
+# transitions that were pre-initialised at zero in the application, so its
+# numerator series always exists. Pre-initialising your metrics removes this
+# whole class of problem at the source — PromQL gymnastics are what you write
+# when you could not.
+# ---------------------------------------------------------------------------
+
+groups:
+  # ---------------------------------------------------------------------------
+  - name: orders_http
+    interval: 15s
+    rules:
+      # Request rate, at two aggregation levels. Dashboards use the detailed
+      # one; SLO maths uses the job-level one.
+      - record: job_route_method:orders_http_requests:rate5m
+        expr: sum by (job, route, method) (rate(orders_http_requests_total[5m]))
+
+      - record: job:orders_http_requests:rate5m
+        expr: sum by (job) (rate(orders_http_requests_total[5m]))
+
+      # SERVER errors only. 4xx are client mistakes — a bad UUID, a validation
+      # failure — and counting them against your availability makes your SLO
+      # track how often clients send garbage. Our load generator deliberately
+      # produces ~20% 4xx; if those counted, this service would look permanently
+      # broken while being entirely healthy.
+      - record: job:orders_http_errors:rate5m
+        expr: sum by (job) (rate(orders_http_requests_total{status_class="5xx"}[5m]))
+
+      # THE availability SLI. Everything downstream uses this one definition.
+      - record: job:orders_http_error_ratio:rate5m
+        expr: |
+          (
+            sum by (job) (rate(orders_http_requests_total{status_class="5xx"}[5m]))
+            or
+            sum by (job) (rate(orders_http_requests_total[5m]) * 0)
+          )
+          /
+          clamp_min(sum by (job) (rate(orders_http_requests_total[5m])), 1e-9)
+
+      # Latency percentiles, pre-aggregated by (le) so they are correct to
+      # combine across replicas.
+      #
+      # These still return NaN when there is no traffic — histogram_quantile
+      # over all-zero buckets has no meaningful answer, and unlike a ratio
+      # there is no denominator to clamp. That is acceptable because NaN fails
+      # SAFE in PromQL: `NaN > 0.25` is false, so the latency alert simply does
+      # not fire on a silent service. Worth knowing rather than fighting.
+      - record: job_route:orders_http_request_duration_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (job, route, le) (rate(orders_http_request_duration_seconds_bucket[5m]))
+          )
+
+      - record: job_route:orders_http_request_duration_seconds:p50_5m
+        expr: |
+          histogram_quantile(0.50,
+            sum by (job, route, le) (rate(orders_http_request_duration_seconds_bucket[5m]))
+          )
+
+  # ---------------------------------------------------------------------------
+  # SLO windows.
+  #
+  # A burn-rate alert needs the SAME ratio over several window lengths. Each is
+  # recorded separately so the alert expression stays readable and each window
+  # is computed once regardless of how many alerts reference it.
+  # ---------------------------------------------------------------------------
+  - name: orders_slo_windows
+    interval: 30s
+    rules:
+      # Availability: fraction of requests that FAILED (5xx).
+      - record: job:orders_slo_availability_errors:ratio_rate5m
+        expr: |
+          (
+            sum by (job) (rate(orders_http_requests_total{status_class="5xx"}[5m]))
+            or
+            sum by (job) (rate(orders_http_requests_total[5m]) * 0)
+          )
+          / clamp_min(sum by (job) (rate(orders_http_requests_total[5m])), 1e-9)
+
+      - record: job:orders_slo_availability_errors:ratio_rate30m
+        expr: |
+          (
+            sum by (job) (rate(orders_http_requests_total{status_class="5xx"}[30m]))
+            or
+            sum by (job) (rate(orders_http_requests_total[30m]) * 0)
+          )
+          / clamp_min(sum by (job) (rate(orders_http_requests_total[30m])), 1e-9)
+
+      - record: job:orders_slo_availability_errors:ratio_rate1h
+        expr: |
+          (
+            sum by (job) (rate(orders_http_requests_total{status_class="5xx"}[1h]))
+            or
+            sum by (job) (rate(orders_http_requests_total[1h]) * 0)
+          )
+          / clamp_min(sum by (job) (rate(orders_http_requests_total[1h])), 1e-9)
+
+      - record: job:orders_slo_availability_errors:ratio_rate6h
+        expr: |
+          (
+            sum by (job) (rate(orders_http_requests_total{status_class="5xx"}[6h]))
+            or
+            sum by (job) (rate(orders_http_requests_total[6h]) * 0)
+          )
+          / clamp_min(sum by (job) (rate(orders_http_requests_total[6h])), 1e-9)
+
+      # Latency: fraction of requests SLOWER than the 250ms objective.
+      #
+      # This is why Phase 2 put a bucket boundary exactly on 0.25. The "good"
+      # count comes straight from the le="0.25" bucket — no interpolation, no
+      # estimate. If that boundary did not exist, your SLO compliance number
+      # would be a guess, and you would be reporting a guess to customers.
+      - record: job:orders_slo_latency_errors:ratio_rate5m
+        expr: |
+          1 - (
+            sum by (job) (rate(orders_http_request_duration_seconds_bucket{le="0.25",status_class!="5xx"}[5m]))
+            / clamp_min(sum by (job) (rate(orders_http_request_duration_seconds_count{status_class!="5xx"}[5m])), 1e-9)
+          )
+
+      - record: job:orders_slo_latency_errors:ratio_rate30m
+        expr: |
+          1 - (
+            sum by (job) (rate(orders_http_request_duration_seconds_bucket{le="0.25",status_class!="5xx"}[30m]))
+            / clamp_min(sum by (job) (rate(orders_http_request_duration_seconds_count{status_class!="5xx"}[30m])), 1e-9)
+          )
+
+      - record: job:orders_slo_latency_errors:ratio_rate1h
+        expr: |
+          1 - (
+            sum by (job) (rate(orders_http_request_duration_seconds_bucket{le="0.25",status_class!="5xx"}[1h]))
+            / clamp_min(sum by (job) (rate(orders_http_request_duration_seconds_count{status_class!="5xx"}[1h])), 1e-9)
+          )
+
+      - record: job:orders_slo_latency_errors:ratio_rate6h
+        expr: |
+          1 - (
+            sum by (job) (rate(orders_http_request_duration_seconds_bucket{le="0.25",status_class!="5xx"}[6h]))
+            / clamp_min(sum by (job) (rate(orders_http_request_duration_seconds_count{status_class!="5xx"}[6h])), 1e-9)
+          )
+
+  # ---------------------------------------------------------------------------
+  - name: orders_db
+    interval: 15s
+    rules:
+      # ignoring(state) is required: the left side carries state="acquired" and
+      # the right side has no state label, so the default full-label-set match
+      # finds nothing and silently returns no data.
+      - record: job:orders_db_pool_utilisation:ratio
+        expr: |
+          orders_db_pool_connections{state="acquired"}
+          / ignoring(state) orders_db_pool_max_connections
+
+      # Saturation: what fraction of acquisitions had to WAIT for a free
+      # connection. This is the number that distinguishes "the database is
+      # slow" from "we are out of connections".
+      - record: job:orders_db_pool_empty_acquire:ratio_rate5m
+        expr: |
+          rate(orders_db_pool_empty_acquires_total[5m])
+          / clamp_min(rate(orders_db_pool_acquires_total[5m]), 1e-9)
+
+      - record: job:orders_db_pool_acquire_wait_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (job, le) (rate(orders_db_pool_acquire_wait_seconds_bucket[5m]))
+          )
+
+      - record: job_query:orders_db_query_duration_seconds:mean5m
+        expr: |
+          rate(orders_db_query_duration_seconds_sum[5m])
+          / clamp_min(rate(orders_db_query_duration_seconds_count[5m]), 1e-9)
+
+  # ---------------------------------------------------------------------------
+  - name: orders_business
+    interval: 30s
+    rules:
+      - record: job:orders_created:rate5m
+        expr: sum by (job) (rate(orders_created_total[5m]))
+
+      # Revenue per second, in whole currency units.
+      - record: job_currency:orders_revenue:rate5m
+        expr: sum by (job, currency) (rate(orders_created_value_cents_total[5m])) / 100
+
+      - record: job:orders_payment_failure:ratio_rate5m
+        expr: |
+          sum by (job) (rate(orders_state_transitions_total{to="failed"}[5m]))
+          / clamp_min(sum by (job) (rate(orders_state_transitions_total{from="processing"}[5m])), 1e-9)

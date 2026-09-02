@@ -1,0 +1,144 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: mlt-postgres
+    environment:
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+      POSTGRES_DB: orders
+    ports:
+      - "5440:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    # Turn on pg_stat_statements so we can compare *our* query metrics against
+    # what Postgres itself measured. Used from Phase 3 onward.
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_stat_statements"
+      - "-c"
+      - "pg_stat_statements.track=all"
+
+  api:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-v0.7.0-phase7}
+        COMMIT: ${COMMIT:-local}
+    image: mlt/orders-api:latest
+    container_name: mlt-api
+    ports:
+      - "8086:8086"
+      - "9100:9100"
+    environment:
+      APP_ENV: dev
+      HTTP_ADDR: ":8086"
+      METRICS_ADDR: ":9100"
+      # Service name, not localhost: inside the compose network `postgres`
+      # resolves to the container. This is the single most common mistake when
+      # moving an app from the host into compose.
+      DATABASE_URL: postgres://orders:orders@postgres:5432/orders?sslmode=disable
+      LOG_LEVEL: info
+      WORKER_ENABLED: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: mlt-prometheus
+    ports:
+      - "9095:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      # Watched live by file_sd — edit the JSON and Prometheus picks it up
+      # within refresh_interval, with no restart.
+      - ./prometheus/targets:/etc/prometheus/targets:ro
+      - promdata:/prometheus
+    # On Linux, host.docker.internal is not resolvable by default. host-gateway
+    # maps it to the Docker bridge gateway, which is how a container reaches a
+    # service listening on the host — in our case the Go app on :9100.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # How long raw samples are kept. Prometheus is a short-horizon store by
+      # design; anything longer belongs in a remote-write backend.
+      - "--storage.tsdb.retention.time=7d"
+      # Required to ingest native histograms; without it the protobuf scrape
+      # still works but the exponential buckets are discarded.
+      - "--enable-feature=native-histograms"
+      # Lets `make prom-reload` apply config changes without a restart, which
+      # matters in production: restarting Prometheus loses in-memory state and
+      # creates a gap in every series it stores.
+      - "--web.enable-lifecycle"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    container_name: mlt-alertmanager
+    ports:
+      - "9096:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - amdata:/alertmanager
+    # The webhook sink runs on the host, same as the app.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      # Must match the published port, or the "Silence" links in the UI point
+      # somewhere unreachable.
+      - "--web.external-url=http://localhost:9096"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9093/-/healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: mlt-grafana
+    ports:
+      - "3005:3000"
+    volumes:
+      # Provisioning as CODE. Datasources and dashboards are defined in files
+      # in git, applied on startup. The alternative — clicking dashboards
+      # together in the UI — means they live only in Grafana's sqlite database,
+      # are impossible to review or diff, and are gone the moment someone
+      # recreates the container.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    environment:
+      # Local-only convenience. Never do this anywhere reachable.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: dark
+      # Land on the RED dashboard instead of an empty home page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/orders-red.json
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  promdata:
+  amdata:
+  grafanadata:

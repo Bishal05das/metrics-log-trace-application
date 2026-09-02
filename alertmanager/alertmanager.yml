@@ -1,0 +1,106 @@
+# Alertmanager is a separate process from Prometheus, and the split is
+# deliberate: Prometheus decides WHETHER something is wrong, Alertmanager
+# decides WHO hears about it and HOW OFTEN.
+#
+# The machinery below is what stops one incident from sending 400 notifications.
+# Without it, a database outage that trips 12 rules across 30 pods produces 360
+# separate pages, and the useful signal is lost in the flood.
+
+global:
+  # If Prometheus stops sending an alert without explicitly resolving it (say
+  # Prometheus itself crashed), Alertmanager marks it resolved after this.
+  # Prometheus re-sends active alerts every ~15s, so 5m is a safe margin.
+  resolve_timeout: 5m
+
+templates:
+  - /etc/alertmanager/templates/*.tmpl
+
+route:
+  receiver: default
+
+  # GROUPING: alerts sharing these label values arrive in ONE notification.
+  #
+  # Grouping by [alertname, service] means "OrdersHighLatency firing on 30 pods"
+  # is one notification listing 30 instances, not 30 pages. Choose these labels
+  # carefully — grouping by too much (adding `instance`) defeats the purpose;
+  # grouping by too little merges unrelated incidents into one confusing page.
+  group_by: [alertname, service]
+
+  # Wait this long after the FIRST alert in a new group before notifying, so
+  # related alerts firing together arrive in the same message. A real incident
+  # trips several rules within seconds; this collects them.
+  group_wait: 10s
+
+  # Once a group has notified, wait at least this long before sending an update
+  # about NEW alerts added to that same group.
+  group_interval: 30s
+
+  # Re-send an unresolved alert this often. Long enough not to be noise, short
+  # enough that a still-broken thing is not forgotten. 4h is a common choice;
+  # some teams use 1h for critical only.
+  repeat_interval: 4h
+
+  routes:
+    # Routes are matched in order, first match wins unless continue: true.
+    - matchers:
+        - severity = critical
+      receiver: pager
+      # Page faster: 5s of collection instead of 10s.
+      group_wait: 5s
+      repeat_interval: 1h
+
+    - matchers:
+        - severity = warning
+      receiver: ticket
+
+# INHIBITION: suppress alerts that are merely consequences of a bigger one.
+#
+# This is the highest-leverage feature here and the least used. During a real
+# incident the cause fires alongside a dozen effects; inhibition means the
+# on-call sees the cause.
+inhibit_rules:
+  # A critical alert silences the warning-level alert of the SAME name and
+  # service. Without this, a condition crossing both thresholds pages twice.
+  - source_matchers:
+      - severity = critical
+    target_matchers:
+      - severity = warning
+    equal: [alertname, service]
+
+  # If the target is down, EVERY other alert for that service is a consequence
+  # of the same fact. Send one page about the process being gone, not fifteen
+  # about the metrics it stopped reporting.
+  - source_matchers:
+      - alertname = OrdersTargetDown
+    target_matchers:
+      - service = orders
+    equal: [service]
+
+  # Pool saturation causes latency and errors. When it is firing, it IS the
+  # explanation — suppress the symptoms so the cause is what gets read.
+  - source_matchers:
+      - alertname = OrdersDBPoolSaturated
+    target_matchers:
+      - alertname =~ "OrdersHighLatency|OrdersLatencyBudgetBurnFast"
+    equal: [service]
+
+receivers:
+  # In production these are Slack, PagerDuty, Opsgenie. Here they are all the
+  # same local webhook sink so you can watch the routing happen without needing
+  # any external credentials — the routing logic is identical either way.
+  - name: default
+    webhook_configs:
+      - url: http://host.docker.internal:9101/alerts
+        send_resolved: true
+
+  - name: pager
+    webhook_configs:
+      - url: http://host.docker.internal:9101/alerts?route=pager
+        # Notify when the alert CLEARS as well. Worth having: an incident that
+        # resolves itself at 4am is information the on-call needs.
+        send_resolved: true
+
+  - name: ticket
+    webhook_configs:
+      - url: http://host.docker.internal:9101/alerts?route=ticket
+        send_resolved: true

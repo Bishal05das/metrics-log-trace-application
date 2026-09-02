@@ -1,0 +1,135 @@
+global:
+  # How often Prometheus pulls each target. This is your resolution floor:
+  # nothing shorter than this is visible, ever. 15s is the common production
+  # default and the right trade between resolution and storage.
+  scrape_interval: 15s
+
+  # A scrape that takes longer than this is abandoned and recorded as a
+  # failure. It MUST be shorter than scrape_interval, or scrapes overlap.
+  scrape_timeout: 10s
+
+  # How often alerting and recording rules are evaluated (Phase 6).
+  evaluation_interval: 15s
+
+  # Attached to every series this Prometheus stores, and used to identify the
+  # source when federating or remote-writing to a central store. Keep it to
+  # things that are constant for the whole server.
+  external_labels:
+    cluster: local
+    env: dev
+
+# Rule files are evaluated every `evaluation_interval`. Recording rules create
+# new series; alerting rules create alerts that are pushed to Alertmanager.
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  # ---------------------------------------------------------------------------
+  # The orders service.
+  #
+  # The app runs on the HOST (so `make run` stays a fast edit-rebuild loop)
+  # while Prometheus runs in Docker. `host.docker.internal` is how a container
+  # reaches the host; on Linux it only resolves because docker-compose.yml maps
+  # it to host-gateway via extra_hosts.
+  # ---------------------------------------------------------------------------
+  - job_name: orders-api
+
+    # Faster than the global default purely for learning: you see graphs move
+    # in seconds instead of minutes. In production this costs you storage and
+    # scrape load for resolution you usually cannot act on — 15s is normal,
+    # 5s is for things you genuinely need fine detail on.
+    scrape_interval: 5s
+    scrape_timeout: 4s
+
+    metrics_path: /metrics
+
+    # Protocol negotiation, in preference order. PrometheusProto (protobuf) is
+    # first because it is the only one that carries NATIVE HISTOGRAMS — the
+    # exponential-bucket representation our histograms also emit. Without it,
+    # Prometheus falls back to text and stores only the classic `le` buckets.
+    # Requires --enable-feature=native-histograms on the server.
+    scrape_protocols:
+      - PrometheusProto
+      - OpenMetricsText1.0.0
+      - PrometheusText0.0.4
+
+    # By DEFAULT, when Prometheus ingests a native histogram it DISCARDS the
+    # classic `le` buckets for that metric — you get one representation, not
+    # both, and every `_bucket` query you wrote silently returns no data.
+    #
+    # That is the right production default (storing both doubles the cost of
+    # the metric you were trying to make cheaper). We turn it on here because
+    # this project is for learning: having both lets you run the same question
+    # against each representation and compare.
+    #
+    # When you migrate a real service, the sequence is: enable both, port your
+    # queries and dashboards to the native form, verify they agree, then turn
+    # this off and delete the classic buckets from the application.
+    always_scrape_classic_histograms: true
+
+    # File-based service discovery instead of a hardcoded target.
+    #
+    # Prometheus WATCHES this file and picks up changes within seconds — no
+    # restart, no reload call. That lets `make target-container` and
+    # `make target-host` switch between the containerised app (api:9100) and
+    # one you are running locally (host.docker.internal:9100) mid-session.
+    #
+    # file_sd is also the simplest real service discovery mechanism, and the
+    # escape hatch for anything Prometheus has no native SD for: any system
+    # that can write a JSON file can feed Prometheus its targets.
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/*.json
+        refresh_interval: 10s
+
+    # relabel_configs rewrite the TARGET before scraping. Use them to control
+    # what gets scraped and how it is identified.
+    relabel_configs:
+      # By default `instance` is host:port, which changes if you move the app
+      # to a different port and silently breaks every historical query. Pin it
+      # to something stable and meaningful instead.
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: orders-api-local
+
+    # metric_relabel_configs rewrite SAMPLES after scraping, before storage.
+    # This is where you drop metrics you will never query.
+    #
+    # The distinction matters and is a common source of confusion:
+    #   relabel_configs        → applies to targets  (what to scrape)
+    #   metric_relabel_configs → applies to samples  (what to keep)
+    metric_relabel_configs:
+      # These two Go runtime histograms carry ~90 buckets EACH and describe
+      # allocation size distribution — genuinely useful when you are hunting an
+      # allocation regression, and dead weight the other 99.9% of the time.
+      # Dropping them at scrape time costs nothing and removes ~180 series.
+      #
+      # This is the cheapest cardinality control you have: you do not need to
+      # change the application to stop storing a metric.
+      - source_labels: [__name__]
+        regex: go_gc_heap_(allocs|frees)_by_size_bytes_bucket
+        action: drop
+
+  # ---------------------------------------------------------------------------
+  # Prometheus scraping itself. Always do this — `up`, scrape duration and
+  # sample counts for your monitoring system are how you notice the monitoring
+  # system is the thing that broke.
+  # ---------------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090
+
+  # Alertmanager, for the same reason. If your alert DELIVERY path is broken,
+  # every alert above fires into the void and nothing tells you. Watch
+  # alertmanager_notifications_failed_total in particular.
+  - job_name: alertmanager
+    static_configs:
+      - targets:
+          - alertmanager:9093
