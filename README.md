@@ -5,9 +5,15 @@ in phases so each layer's reasoning is visible.
 
 ```
 Go app  ──/metrics──>  Prometheus  ──>  Alertmanager  ──>  webhook sink
-  │                        │
-  └── PostgreSQL           └──────────>  Grafana
+  │  │                     │
+  │  └── JSON logs ─> stdout        └──>  Grafana
+  └── PostgreSQL
 ```
+
+Two pillars so far: **metrics** (complete, with alerting and dashboards) and
+**logs** (structured, correlated, emitted to stdout). No log aggregation backend
+yet — the app writes JSON to stdout, which is the whole contract; shipping it
+somewhere is a separate concern deliberately left for later.
 
 ## Quick start
 
@@ -15,6 +21,10 @@ Go app  ──/metrics──>  Prometheus  ──>  Alertmanager  ──>  webho
 make up          # whole stack: app, postgres, prometheus, alertmanager, grafana
 make load        # drive synthetic traffic
 make alertsink   # in another terminal: watch alerts arrive
+
+make logs-pretty            # tail the app logs, one readable line each
+make log-level              # read the current level
+make log-level L=debug      # raise it at runtime, no restart
 ```
 
 | | URL |
@@ -59,6 +69,7 @@ cmd/alertsink      local Alertmanager webhook receiver
 internal/domain    Order, Status, validation — no DB or HTTP imports
 internal/store     pgxpool, migrations, named SQL constants
 internal/httpapi   routes, handlers, middleware chain
+internal/logging   slog setup, request-ID correlation, redaction, sampling, level switch
 internal/metrics   registry, RED, database, business metrics — all metrics live here
 internal/worker    background processor + cached-backlog refresher
 prometheus/        scrape config, recording rules, alert rules, file_sd targets
@@ -111,6 +122,15 @@ inhibition turned 5 firing alerts into **1 delivered notification**.
 
 **7 — Dashboards.** Provisioned as code, not clicked into a UI. Multi-stage
 distroless image: **15.1 MB**, non-root, no shell.
+
+**8 — Logs.** The second pillar, application side only. A `ContextHandler`
+attaches request-scoped attributes to every record, so one `X-Request-Id` ties
+the HTTP line, every database query it ran, and any error together — with no
+call site knowing the ID exists. Secrets are redacted centrally in
+`ReplaceAttr`, because relying on developers to remember is how credentials
+reach a log store. Log level is changeable at runtime on the admin port: the
+moment you want debug logs is during an incident, and a restart destroys the
+state you were trying to observe.
 
 ## Metric inventory
 
@@ -165,8 +185,38 @@ endpoint is a denial-of-service primitive.
 make saturate   # 150 rps, 35% slow queries -> pool exhaustion, alerts fire
 ```
 
+## Logging
+
+One structured line per request, plus DB queries at debug:
+
+```json
+{"level":"INFO","msg":"http request","service":"orders","method":"POST",
+ "route":"/orders","status":201,"duration_ms":1.089,"bytes":220,
+ "request_id":"85655692c3909e573c0bf72b3be3037e"}
+```
+
+- **Correlation.** `X-Request-Id` is honoured from upstream (sanitised first —
+  the header is attacker-controlled) or generated, echoed to the client, and
+  attached to every log line for that request via the context.
+- **Severity follows fault.** 5xx is our bug (`ERROR`); 4xx is the client's
+  mistake (`WARN`). Logging 4xx at error fills the error stream with people
+  typing bad UUIDs.
+- **`route` is the matched template**, never the raw path — the same cardinality
+  discipline as the metrics label, and the same value, so you can pivot between
+  the two.
+- **Health probes are excluded**, same as in metrics.
+- **Redaction** happens in one place, `ReplaceAttr`; `PII()` pseudonymises
+  identifiers so you can still correlate a customer's events without storing who
+  they are.
+- **Use the `*Context` variants.** `log.Info()` passes `context.Background()` and
+  silently loses correlation. Do not use `WithGroup` on this logger — it nests
+  `request_id` inside the group.
+
 ## Not built here
 
-Logs and traces — the other two pillars. The service uses `log/slog` with JSON
-output and the metrics layer already emits OpenMetrics with exemplar support,
-which is the hook tracing would attach to.
+- **Log aggregation.** The app writes JSON to stdout and stops there. Shipping to
+  a log store, indexing, and log dashboards are a separate layer.
+- **Traces**, the third pillar. `NewRequestID()` already produces a 128-bit hex
+  value — the same shape as a W3C trace-id — so it becomes the join key when
+  tracing lands, and the metrics layer already emits OpenMetrics with exemplar
+  support, which is the hook traces attach to.

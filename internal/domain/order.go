@@ -36,6 +36,10 @@ var AllTransitions = [][2]string{
 	{string(StatusProcessing), string(StatusPaid)},
 	{string(StatusProcessing), string(StatusFailed)},
 	{string(StatusPending), string(StatusCancelled)},
+	// A claimed order released back to the queue because shutdown interrupted
+	// processing. A steady trickle of these is normal during deploys; a
+	// sustained rate means work is being claimed faster than it completes.
+	{string(StatusProcessing), string(StatusPending)},
 }
 
 // SupportedCurrencies is an allowlist, and it exists for TWO reasons.

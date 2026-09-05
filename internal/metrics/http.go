@@ -173,17 +173,26 @@ func NewHTTP(reg prometheus.Registerer) *HTTP {
 // PreInit creates the series for known route/method pairs at value zero.
 //
 // Why bother: a counter that has never been incremented does not exist in the
-// exposition output at all. `rate()` over a series that appears for the first
-// time returns nothing, dashboards show "No data" instead of a flat zero line,
-// and — worst — an alert like `rate(...errors...) > 0` cannot fire on a series
-// that is absent, so a brand-new failure mode can stay silent.
+// exposition output at all. Worse for a *Vec — a CounterVec with no children
+// emits nothing whatsoever, not even its # HELP and # TYPE lines. `rate()` over
+// a series that appears for the first time returns nothing, dashboards show
+// "No data" instead of a flat zero line, and — worst — an alert like
+// `increase(...panics...) > 0` cannot match a series that is absent, so a
+// brand-new failure mode stays silent exactly when you need it loudest.
 //
-// Pre-initialising the success path means the series exist from the first
-// scrape. You cannot pre-init everything (you do not know which error codes
-// will occur), so the complementary technique is `... or vector(0)` in PromQL.
+// That is not hypothetical: orders_http_panics_total was missing from /metrics
+// entirely until it was added to the loop below, because no handler had ever
+// panicked and nothing else created a child.
+//
 // Each spec is {method, route, success code}. The success code must be the one
 // the handler actually returns — 201 for a create, not 200 — or you get a
 // permanently-zero series next to the real one.
+//
+// You cannot pre-init everything: you do not know in advance which error codes
+// will occur. For those, the guard belongs in PromQL — but NOT `or vector(0)`,
+// which substitutes a LABELLESS series that matches no `by (job)` aggregation.
+// Use `clamp_min` on a denominator, or `or <same aggregation> * 0` to keep the
+// labels. See the note at the top of prometheus/rules/recording.yml.
 func (h *HTTP) PreInit(specs ...[3]string) {
 	for _, s := range specs {
 		method, route, code := s[0], s[1], s[2]
@@ -197,7 +206,12 @@ func (h *HTTP) PreInit(specs ...[3]string) {
 		h.requests.WithLabelValues(route, method, code, class)
 		h.duration.WithLabelValues(route, method, class)
 		h.respSize.WithLabelValues(route, method)
+		h.panics.WithLabelValues(route)
 	}
+
+	// The catch-all handler can panic too, and its label value never appears in
+	// the route table above.
+	h.panics.WithLabelValues(routeUnmatched)
 }
 
 // Middleware records RED metrics for every request it wraps.
@@ -207,7 +221,7 @@ func (h *HTTP) Middleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-
+		//How many requests are currently being processed.
 		h.inFlight.Inc()
 		defer h.inFlight.Dec()
 

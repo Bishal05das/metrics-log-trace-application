@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -213,6 +214,57 @@ func TestPreInitMatchesRealSuccessCodes(t *testing.T) {
 	}
 }
 
+// TestEveryHTTPMetricIsExposedAfterPreInit is the guard for a whole class of
+// bug rather than one instance of it.
+//
+// A CounterVec/HistogramVec with no children emits NOTHING — not even its
+// # HELP and # TYPE lines. So a metric can be correctly declared, correctly
+// registered, and still be completely absent from /metrics, which means any
+// alert matching it can never fire. orders_http_panics_total was in exactly
+// that state until PreInit was taught to touch it.
+//
+// This asserts that after PreInit, every metric this package registers is
+// actually present in the exposition output.
+func TestEveryHTTPMetricIsExposedAfterPreInit(t *testing.T) {
+	m, reg := newTestHTTP(t)
+	m.PreInit([3]string{http.MethodPost, "/orders", "201"})
+
+	want := []string{
+		"orders_http_requests_total",
+		"orders_http_request_duration_seconds",
+		"orders_http_response_size_bytes",
+		"orders_http_requests_in_flight",
+		"orders_http_panics_total",
+	}
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	got := make(map[string]bool, len(mfs))
+	for _, mf := range mfs {
+		got[mf.GetName()] = true
+	}
+
+	for _, name := range want {
+		if !got[name] {
+			t.Errorf("%s is registered but absent from the exposition output; "+
+				"it needs a child series created in PreInit", name)
+		}
+	}
+}
+
+// TestPanicsSeriesExistsForUnmatchedRoute — the catch-all handler can panic
+// too, and "unmatched" never appears in the route table.
+func TestPanicsSeriesExistsForUnmatchedRoute(t *testing.T) {
+	m, _ := newTestHTTP(t)
+	m.PreInit([3]string{http.MethodGet, "/orders", "200"})
+
+	if got := testutil.ToFloat64(m.panics.WithLabelValues(routeUnmatched)); got != 0 {
+		t.Fatalf("panics{route=%q} = %v, want a pre-initialised 0", routeUnmatched, got)
+	}
+}
+
 func TestStatusClass(t *testing.T) {
 	cases := map[int]string{
 		100: "1xx", 200: "2xx", 201: "2xx", 301: "3xx",
@@ -237,5 +289,68 @@ func TestInFlightReturnsToZero(t *testing.T) {
 
 	if got := testutil.ToFloat64(m.inFlight); got != 0 {
 		t.Fatalf("in-flight gauge leaked: %v", got)
+	}
+}
+
+// TestRouteLabelSurvivesRequestCloning is the regression test for a bug that
+// escaped into a running system.
+//
+// A middleware that calls r.WithContext() — request IDs, tracing, auth, almost
+// anything that enriches the context — hands ServeMux a COPY. ServeMux sets
+// Pattern on that copy, so this middleware, sitting outside it, saw an empty
+// Pattern and labelled every single request "unmatched". In production that
+// looked like 1333 requests on route="unmatched" with every real per-route
+// series pinned at zero.
+//
+// Nothing caught it: the counter totals were still correct, and the tests here
+// wrapped the mux directly with no cloning middleware in between. This test
+// reproduces the real chain shape.
+func TestRouteLabelSurvivesRequestCloning(t *testing.T) {
+	m, _ := newTestHTTP(t)
+
+	// A stand-in for RequestID()/tracing.Middleware: it clones the request and
+	// copies the routing result back on the way out.
+	cloner := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := context.WithValue(r.Context(), struct{ k string }{"x"}, "y")
+			inner := r.WithContext(ctx)
+			next.ServeHTTP(w, inner)
+			r.Pattern = inner.Pattern
+		})
+	}
+
+	h := m.Middleware(cloner(testMux()))
+	do(h, http.MethodGet, "/orders/abc")
+
+	if got := testutil.ToFloat64(
+		m.requests.WithLabelValues("/orders/{id}", "GET", "200", "2xx")); got != 1 {
+		t.Fatalf("route label lost across a cloning middleware: "+
+			"/orders/{id} counter = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(
+		m.requests.WithLabelValues(routeUnmatched, "GET", "200", "2xx")); got != 0 {
+		t.Fatalf("request was labelled %q instead of its route template", routeUnmatched)
+	}
+}
+
+// TestRouteLabelIsLostWithoutPatternPropagation documents WHY the one-line
+// copy-back in the cloning middlewares is load-bearing. Delete it there and
+// this is the behaviour you get.
+func TestRouteLabelIsLostWithoutPatternPropagation(t *testing.T) {
+	m, _ := newTestHTTP(t)
+
+	brokenCloner := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(context.Background()))
+			// no r.Pattern = inner.Pattern
+		})
+	}
+
+	h := m.Middleware(brokenCloner(testMux()))
+	do(h, http.MethodGet, "/orders/abc")
+
+	if got := testutil.ToFloat64(
+		m.requests.WithLabelValues(routeUnmatched, "GET", "200", "2xx")); got != 1 {
+		t.Fatalf("expected the broken cloner to produce an 'unmatched' label, got %v", got)
 	}
 }

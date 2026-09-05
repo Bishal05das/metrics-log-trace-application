@@ -26,6 +26,9 @@ import urllib.request
 EXPECT_EMPTY = {
     "Query errors by SQLSTATE",
     "Firing alerts",
+    # Both are ALERTS/error-filtered queries: empty is the healthy state.
+    "Currently pending or firing",
+    "Log pipeline health",
     # Only the FAILED series of this panel is filtered with `> 0`; the "sent"
     # series must always return data, and does.
     "Is alert DELIVERY healthy?",
@@ -47,6 +50,12 @@ def expand(expr):
     return expr
 
 
+def panel_ds(panel, target):
+    """Which datasource does this target use? Panel-level unless overridden."""
+    ds = target.get("datasource") or panel.get("datasource") or {}
+    return (ds.get("type") or "").lower()
+
+
 def walk_panels(panels):
     for p in panels:
         yield p
@@ -58,7 +67,7 @@ def main():
     base = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:9095"
     dashdir = sys.argv[2] if len(sys.argv) > 2 else "grafana/dashboards"
 
-    total = ok = empty = failed = 0
+    total = ok = empty = failed = skipped = 0
     problems = []
 
     for path in sorted(glob.glob(os.path.join(dashdir, "*.json"))):
@@ -70,6 +79,12 @@ def main():
             for t in panel.get("targets", []) or []:
                 expr = t.get("expr")
                 if not expr:
+                    continue
+
+                # Only Prometheus targets can be checked here. LogQL panels
+                # need a Loki endpoint and a different query API.
+                if panel_ds(panel, t) != "prometheus":
+                    skipped += 1
                     continue
                 total += 1
                 try:
@@ -98,7 +113,8 @@ def main():
                     ok += 1
                     print(f"    ok      {title:<42} {n} series")
 
-    print(f"\n  {total} queries: {ok} with data, {empty} empty, {failed} invalid")
+    print(f"\n  {total} prometheus queries: {ok} with data, {empty} empty, {failed} invalid"
+          + (f"  ({skipped} non-prometheus targets skipped)" if skipped else ""))
 
     unexpected = [p for p in problems if p[2] != "returned no series" or p[1] not in EXPECT_EMPTY]
     if unexpected:

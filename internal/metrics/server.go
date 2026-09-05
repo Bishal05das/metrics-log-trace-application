@@ -25,7 +25,11 @@ import (
 //     so a 15s scrape interval does not pollute your RPS and latency numbers.
 //
 // This is the standard production layout, and it costs about 30 lines.
-func NewServer(addr string, reg *prometheus.Registry, log *slog.Logger) *http.Server {
+// extraRoutes let other packages mount handlers on the admin port without this
+// package importing them — e.g. the runtime log-level switch from
+// internal/logging. Everything here is internal-only by design; see the note
+// above about why it is a separate listener.
+func NewServer(addr string, reg *prometheus.Registry, log *slog.Logger, extraRoutes ...func(*http.ServeMux)) *http.Server {
 	handler := promhttp.HandlerFor(reg, promhttp.HandlerOpts{
 		// Return HTTP 500 if a collector fails, so a broken exporter shows up
 		// as a scrape failure instead of silently serving partial data.
@@ -52,6 +56,10 @@ func NewServer(addr string, reg *prometheus.Registry, log *slog.Logger) *http.Se
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", handler)
+
+	for _, register := range extraRoutes {
+		register(mux)
+	}
 
 	// A tiny landing page, purely so a human who opens the port knows what it
 	// is. Costs nothing and saves confusion.

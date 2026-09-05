@@ -222,6 +222,71 @@ func TestOutcomeIsPersistedEvenWhenContextCancelled(t *testing.T) {
 	}
 }
 
+// TestInterruptedOrderIsReleasedNotStranded is the regression test for a bug
+// that TestOutcomeIsPersistedEvenWhenContextCancelled did NOT catch.
+//
+// That test used a processor which SUCCEEDS despite cancellation. The real
+// processor returns ctx.Err() instead, and the cancellation branch used to
+// return before the detached write — so the order stayed in `processing`
+// forever with no worker owning it. It only showed up by SIGTERMing a live
+// process and counting rows.
+func TestInterruptedOrderIsReleasedNotStranded(t *testing.T) {
+	o := order()
+	st := newFakeStore(o)
+	m := newFakeMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	w := New(st, m, testLogger(), Config{}).
+		WithProcessor(func(c context.Context, _ domain.Order) (domain.Status, error) {
+			cancel()                             // shutdown lands mid-attempt
+			return domain.StatusPending, c.Err() // what simulatePayment really does
+		})
+
+	w.runOnce(ctx)
+
+	if got := st.marked[o.ID]; got != domain.StatusPending {
+		t.Fatalf("interrupted order is %q; want it released back to pending "+
+			"(empty means it was stranded in `processing`)", got)
+	}
+	if got := m.transitions[[2]string{"processing", "pending"}]; got != 1 {
+		t.Errorf("processing→pending transition = %d, want 1", got)
+	}
+	// It must NOT be reported as a payment failure — nothing was attempted.
+	if got := m.transitions[[2]string{"processing", "failed"}]; got != 0 {
+		t.Errorf("an interrupted order must not count as failed, got %d", got)
+	}
+	if got := m.processed["failed"]; got != 0 {
+		t.Errorf("an interrupted order must not be recorded as processed, got %d", got)
+	}
+}
+
+// TestWholeBatchIsReleasedOnShutdown — the claim moves an entire batch into
+// `processing` in one statement, so a signal mid-batch must not strand the
+// orders that had not been reached yet.
+func TestWholeBatchIsReleasedOnShutdown(t *testing.T) {
+	orders := []domain.Order{order(), order(), order(), order()}
+	st := newFakeStore(orders...)
+	m := newFakeMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	w := New(st, m, testLogger(), Config{BatchSize: 10}).
+		WithProcessor(func(c context.Context, _ domain.Order) (domain.Status, error) {
+			cancel()
+			return domain.StatusPending, c.Err()
+		})
+
+	w.runOnce(ctx)
+
+	for _, o := range orders {
+		if st.marked[o.ID] != domain.StatusPending {
+			t.Fatalf("order %s left as %q; every claimed order must be released",
+				o.ID, st.marked[o.ID])
+		}
+	}
+}
+
 func TestRunStopsOnContextCancel(t *testing.T) {
 	m := newFakeMetrics()
 	w := New(newFakeStore(), m, testLogger(), Config{Interval: 5 * time.Millisecond})

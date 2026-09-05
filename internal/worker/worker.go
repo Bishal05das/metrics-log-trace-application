@@ -18,6 +18,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/bishal05das/metrics-log-trace-application/internal/domain"
 )
@@ -52,6 +56,12 @@ type Config struct {
 	FailureRate float64
 	MinLatency  time.Duration
 	MaxLatency  time.Duration
+
+	// Tracer is optional. Background work produces ROOT spans — there is no
+	// incoming request to be a child of — so each batch becomes its own trace.
+	// That is what makes "why did this order take 40 seconds to process?"
+	// answerable at all; the HTTP trace ended when the order was accepted.
+	Tracer trace.Tracer
 }
 
 func (c Config) withDefaults() Config {
@@ -66,6 +76,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MaxLatency <= c.MinLatency {
 		c.MaxLatency = c.MinLatency + 45*time.Millisecond
+	}
+	if c.Tracer == nil {
+		c.Tracer = noop.NewTracerProvider().Tracer("worker")
 	}
 	return c
 }
@@ -119,12 +132,17 @@ func (w *Worker) Run(ctx context.Context) {
 func (w *Worker) runOnce(ctx context.Context) {
 	start := time.Now()
 
+	ctx, span := w.cfg.Tracer.Start(ctx, "worker.batch", trace.WithSpanKind(trace.SpanKindConsumer))
+	defer span.End()
+
 	orders, err := w.store.ClaimPendingOrders(ctx, w.cfg.BatchSize)
 	if err != nil {
 		if ctx.Err() != nil {
 			return // shutting down; not a failure
 		}
 		w.log.ErrorContext(ctx, "claim pending orders failed", "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "claim failed")
 		w.metrics.WorkerRun("error", 0, time.Since(start))
 		return
 	}
@@ -134,9 +152,12 @@ func (w *Worker) runOnce(ctx context.Context) {
 		// nothing. Separating "empty" from "ok" lets you tell "the worker is
 		// keeping up" apart from "the worker has stopped receiving work",
 		// which look identical if you only count successes.
+		span.SetAttributes(attribute.Int("batch.size", 0))
 		w.metrics.WorkerRun("empty", 0, time.Since(start))
 		return
 	}
+
+	span.SetAttributes(attribute.Int("batch.size", len(orders)))
 
 	// The claim already committed pending → processing for the whole batch, so
 	// record those transitions up front rather than per-order below.
@@ -154,21 +175,47 @@ func (w *Worker) runOnce(ctx context.Context) {
 func (w *Worker) processOne(ctx context.Context, o domain.Order) {
 	start := time.Now()
 
+	ctx, span := w.cfg.Tracer.Start(ctx, "worker.process_order",
+		trace.WithAttributes(attribute.String("order.id", o.ID.String())))
+	defer span.End()
+
+	// The detached write context is built FIRST, because every exit path below
+	// needs it — including the cancellation path.
+	//
+	// The claim already committed this order into `processing`, so from here on
+	// this worker owns a row that no one else will touch. Returning without
+	// writing something strands it there permanently. A `context.WithoutCancel`
+	// write is the only way to finish the job once the parent context is gone,
+	// and it has to be reachable from the cancellation branch — an earlier
+	// version created it below that branch, which meant the one shutdown path
+	// it existed to protect was the one path that skipped it.
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
 	outcome, err := w.process(ctx, o)
-	if err != nil {
-		if ctx.Err() != nil {
+
+	if err != nil && ctx.Err() != nil {
+		// Shutdown interrupted the attempt. The work genuinely did not happen,
+		// so the order goes BACK to `pending` to be picked up after restart.
+		//
+		// Marking it `failed` would be a lie — it would claim a payment failed
+		// that was never attempted, and it is a terminal state, so the order
+		// would never be retried. Releasing is the honest, recoverable choice.
+		if relErr := w.store.MarkOrder(writeCtx, o.ID, domain.StatusPending); relErr != nil {
+			w.log.Error("releasing interrupted order failed",
+				"order_id", o.ID, "error", relErr)
 			return
 		}
+		w.log.Info("released interrupted order back to pending", "order_id", o.ID)
+		span.SetStatus(codes.Error, "interrupted; released to pending")
+		w.metrics.Transition(string(domain.StatusProcessing), string(domain.StatusPending))
+		return
+	}
+
+	if err != nil {
 		w.log.ErrorContext(ctx, "processing order failed", "order_id", o.ID, "error", err)
 		outcome = domain.StatusFailed
 	}
-
-	// Use a detached context for the final write. If the parent context is
-	// already cancelled by a shutdown, we still need to record the outcome —
-	// otherwise the order is stuck in `processing` forever with no worker
-	// owning it, which is the classic background-job leak.
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
 
 	if err := w.store.MarkOrder(writeCtx, o.ID, outcome); err != nil {
 		if errors.Is(err, domain.ErrConflict) {
@@ -181,6 +228,10 @@ func (w *Worker) processOne(ctx context.Context, o domain.Order) {
 		return
 	}
 
+	span.SetAttributes(attribute.String("order.outcome", string(outcome)))
+	if outcome == domain.StatusFailed {
+		span.SetStatus(codes.Error, "payment failed")
+	}
 	w.metrics.Transition(string(domain.StatusProcessing), string(outcome))
 	w.metrics.OrderProcessed(string(outcome), time.Since(start))
 }

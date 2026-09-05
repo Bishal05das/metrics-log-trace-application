@@ -57,8 +57,23 @@ target-container: ## Point Prometheus at the containerised app
 	@echo "scrape target -> api:9100 (file_sd picks this up within 10s, no restart)"
 
 .PHONY: logs
-logs: ## Tail the app container logs
+logs: ## Tail the app container logs (raw JSON)
 	docker compose logs -f api
+
+.PHONY: logs-pretty
+logs-pretty: ## Tail the app logs, one readable line each
+	@docker compose logs -f --no-log-prefix api 2>/dev/null | python3 scripts/prettylog.py
+
+.PHONY: traces
+traces: ## Render recent traces as a waterfall (TRACE=<id> for one)
+	@docker compose logs api --since $(or $(SINCE),2m) --no-log-prefix 2>/dev/null \
+		| python3 scripts/waterfall.py $(TRACE)
+
+.PHONY: log-level
+log-level: ## Get or set the runtime log level: make log-level L=debug
+	@if [ -z "$(L)" ]; then curl -sS $(METRICS_URL)/loglevel; echo; \
+	else curl -sS -X PUT "$(METRICS_URL)/loglevel?level=$(L)"; echo; fi
+
 
 .PHONY: down
 down: ## Stop the stack (keeps data)
@@ -148,7 +163,7 @@ check: vet test check-rules check-dashboards ## Everything CI should run
 .PHONY: check-rules
 check-rules: ## Validate rule files with promtool before loading them
 	@docker run --rm -v $(PWD)/prometheus/rules:/rules:ro \
-		--entrypoint /bin/promtool prom/prometheus:v3.1.0 check rules /rules/recording.yml /rules/alerts.yml
+		--entrypoint sh prom/prometheus:v3.1.0 -c 'promtool check rules /rules/*.yml'
 
 .PHONY: q
 q: ## Run a PromQL query: make q Q='sum(rate(orders_http_requests_total[1m]))'

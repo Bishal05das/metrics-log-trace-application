@@ -28,6 +28,24 @@ type Config struct {
 	DBMinConns  int32
 
 	LogLevel string
+	// LogFormat is "json" (machine-readable, what a log pipeline needs) or
+	// "text" (readable in a terminal during local development).
+	LogFormat string
+	// LogSource adds file:line to every record. Costs a runtime.Caller per
+	// record, so it is off by default and flipped on during an investigation.
+	LogSource bool
+	// SlowQueryThreshold promotes a query to a WARN log line regardless of the
+	// configured level. Slow queries are rare by construction, which is what
+	// makes it affordable to always log them.
+	SlowQueryThreshold time.Duration
+
+	// Tracing. Defaults to the stdout exporter so traces are visible with no
+	// backend running; point OTEL_EXPORTER at "otlp" once you have one.
+	TracingEnabled      bool
+	TracingExporter     string
+	TracingOTLPEndpoint string
+	TracingOTLPInsecure bool
+	TracingSampleRatio  float64
 
 	// Background worker.
 	WorkerEnabled     bool
@@ -43,12 +61,20 @@ type Config struct {
 func Load() (Config, error) {
 	cfg := Config{
 		Env:             env("APP_ENV", "dev"),
-		HTTPAddr:        env("HTTP_ADDR", ":8086"),
-		MetricsAddr:     env("METRICS_ADDR", ":9100"),
+		HTTPAddr:        env("HTTP_ADDR", ":8087"),
+		MetricsAddr:     env("METRICS_ADDR", ":9108"),
 		ShutdownTimeout: 15 * time.Second,
 		DatabaseURL: env("DATABASE_URL",
 			"postgres://orders:orders@localhost:5440/orders?sslmode=disable"),
-		LogLevel: env("LOG_LEVEL", "info"),
+		LogLevel:           env("LOG_LEVEL", "info"),
+		LogFormat:          env("LOG_FORMAT", "json"),
+		LogSource:          env("LOG_SOURCE", "false") == "true",
+		SlowQueryThreshold: 200 * time.Millisecond,
+
+		TracingEnabled:      env("TRACING_ENABLED", "true") == "true",
+		TracingExporter:     env("OTEL_EXPORTER", "stdout"),
+		TracingOTLPEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		TracingOTLPInsecure: env("OTEL_EXPORTER_OTLP_INSECURE", "true") == "true",
 
 		WorkerEnabled:   env("WORKER_ENABLED", "true") == "true",
 		WorkerBatchSize: 20,
@@ -58,6 +84,12 @@ func Load() (Config, error) {
 	}
 
 	var err error
+	if cfg.TracingSampleRatio, err = envFloat("TRACING_SAMPLE_RATIO", 1.0); err != nil {
+		return Config{}, err
+	}
+	if cfg.TracingSampleRatio < 0 || cfg.TracingSampleRatio > 1 {
+		return Config{}, fmt.Errorf("config: TRACING_SAMPLE_RATIO must be 0..1, got %v", cfg.TracingSampleRatio)
+	}
 	if cfg.WorkerInterval, err = envDuration("WORKER_INTERVAL", 500*time.Millisecond); err != nil {
 		return Config{}, err
 	}
@@ -117,4 +149,16 @@ func envDuration(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("config: %s: %w", key, err)
 	}
 	return d, nil
+}
+
+func envFloat(key string, def float64) (float64, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s: %w", key, err)
+	}
+	return f, nil
 }
