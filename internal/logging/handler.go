@@ -71,8 +71,23 @@ func (h *ContextHandler) WithGroup(name string) slog.Handler {
 type SamplingHandler struct {
 	slog.Handler
 
+	// state is a POINTER, shared by every handler derived from this one via
+	// WithAttrs or WithGroup. That sharing is load-bearing rather than an
+	// optimisation.
+	//
+	// slog.Logger.With() calls WithAttrs and returns a new handler. New() below
+	// calls .With(service, version, env) immediately, and call sites add their
+	// own. If each derived handler got a fresh bucket map, the "50 per second"
+	// budget would silently become "50 per second PER derived logger" — so a
+	// flood spread across a few call sites would sail straight through the
+	// component whose entire job is to stop it. One counter, shared.
+	state *sampleState
+}
+
+type sampleState struct {
 	perInterval int
 	interval    time.Duration
+	rec         Recorder // may be nil
 
 	mu      sync.Mutex
 	buckets map[string]*bucket
@@ -84,7 +99,8 @@ type bucket struct {
 	dropped     int
 }
 
-func NewSamplingHandler(h slog.Handler, perInterval int, interval time.Duration) *SamplingHandler {
+// NewSamplingHandler wraps h. rec may be nil.
+func NewSamplingHandler(h slog.Handler, perInterval int, interval time.Duration, rec Recorder) *SamplingHandler {
 	if perInterval <= 0 {
 		perInterval = 10
 	}
@@ -92,11 +108,43 @@ func NewSamplingHandler(h slog.Handler, perInterval int, interval time.Duration)
 		interval = time.Second
 	}
 	return &SamplingHandler{
-		Handler:     h,
-		perInterval: perInterval,
-		interval:    interval,
-		buckets:     make(map[string]*bucket),
+		Handler: h,
+		state: &sampleState{
+			perInterval: perInterval,
+			interval:    interval,
+			buckets:     make(map[string]*bucket),
+			rec:         rec,
+		},
 	}
+}
+
+// countingHandler counts every record that reaches it and delegates.
+//
+// It is deliberately the OUTERMOST handler: it must see records before the
+// sampler discards them, or orders_log_records_total would count survivors and
+// the drop RATIO — the number you actually alert on — could not be computed.
+//
+// Cost is one atomic increment per record, which is negligible against the
+// JSON encoding and syscall that follow. It does not need to re-wrap on
+// WithAttrs/WithGroup the way ContextHandler does, but it must anyway: return
+// the bare inner handler and counting silently stops the first time anyone
+// calls logger.With().
+type countingHandler struct {
+	slog.Handler
+	rec Recorder
+}
+
+func (h *countingHandler) Handle(ctx context.Context, r slog.Record) error {
+	h.rec.LogRecord(r.Level.String())
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h *countingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &countingHandler{Handler: h.Handler.WithAttrs(attrs), rec: h.rec}
+}
+
+func (h *countingHandler) WithGroup(name string) slog.Handler {
+	return &countingHandler{Handler: h.Handler.WithGroup(name), rec: h.rec}
 }
 
 func (h *SamplingHandler) Handle(ctx context.Context, r slog.Record) error {
@@ -104,41 +152,49 @@ func (h *SamplingHandler) Handle(ctx context.Context, r slog.Record) error {
 		return h.Handler.Handle(ctx, r)
 	}
 
+	s := h.state
+
 	// One critical section. Releasing the lock between reading and updating the
 	// bucket would let a concurrent record observe a half-updated window, and
 	// under load "concurrent" is the only case that matters.
-	h.mu.Lock()
+	s.mu.Lock()
 
 	// Bound the map. Log messages are supposed to be static strings, but a
 	// caller that interpolates a value into the message ("order abc123 failed")
 	// would otherwise grow this map without limit — a memory leak inside the
 	// component whose job is to prevent runaway logging.
-	if len(h.buckets) > maxSampleKeys {
-		h.buckets = make(map[string]*bucket, maxSampleKeys)
+	if len(s.buckets) > maxSampleKeys {
+		s.buckets = make(map[string]*bucket, maxSampleKeys)
 	}
 
-	b, ok := h.buckets[r.Message]
+	b, ok := s.buckets[r.Message]
 	if !ok {
 		b = &bucket{windowStart: r.Time}
-		h.buckets[r.Message] = b
+		s.buckets[r.Message] = b
 	}
 
 	var dropped int
 	switch {
-	case r.Time.Sub(b.windowStart) >= h.interval:
+	case r.Time.Sub(b.windowStart) >= s.interval:
 		// Window rolled over. Carry the previous window's drop count onto this
 		// record so the true volume is never invisible — silent sampling is how
 		// people end up believing a hot path executes far less than it does.
 		dropped = b.dropped
 		b.windowStart, b.seen, b.dropped = r.Time, 1, 0
-	case b.seen >= h.perInterval:
+	case b.seen >= s.perInterval:
 		b.dropped++
-		h.mu.Unlock()
+		s.mu.Unlock()
+		// Outside the lock: the recorder is a Prometheus counter, and holding
+		// this mutex across a call into another package is how you turn a log
+		// sampler into a contention point on the hot path.
+		if s.rec != nil {
+			s.rec.LogRecordDropped(r.Level.String())
+		}
 		return nil // dropped
 	default:
 		b.seen++
 	}
-	h.mu.Unlock()
+	s.mu.Unlock()
 
 	if dropped > 0 {
 		r.AddAttrs(slog.Int("sampled_dropped", dropped))
@@ -148,16 +204,14 @@ func (h *SamplingHandler) Handle(ctx context.Context, r slog.Record) error {
 
 const maxSampleKeys = 1024
 
+// WithAttrs and WithGroup re-wrap (so sampling is not lost the moment anyone
+// calls logger.With) and SHARE the state pointer (so the budget is not silently
+// multiplied). Getting either half wrong disables the sampler in a way that
+// produces no error and no visible symptom until the bill arrives.
 func (h *SamplingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &SamplingHandler{
-		Handler: h.Handler.WithAttrs(attrs), perInterval: h.perInterval,
-		interval: h.interval, buckets: make(map[string]*bucket),
-	}
+	return &SamplingHandler{Handler: h.Handler.WithAttrs(attrs), state: h.state}
 }
 
 func (h *SamplingHandler) WithGroup(name string) slog.Handler {
-	return &SamplingHandler{
-		Handler: h.Handler.WithGroup(name), perInterval: h.perInterval,
-		interval: h.interval, buckets: make(map[string]*bucket),
-	}
+	return &SamplingHandler{Handler: h.Handler.WithGroup(name), state: h.state}
 }

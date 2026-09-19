@@ -111,6 +111,17 @@ func NewDB(reg prometheus.Registerer, names map[string]string) *DB {
 			Name:      "acquire_wait_seconds",
 			Help:      "Time spent waiting to acquire a connection from the pool.",
 			Buckets:   AcquireWaitBuckets,
+
+			// This is the histogram in the project that most needs native
+			// buckets. Measured live, it swings from 0.010ms on an idle pool to
+			// 1054ms under saturation — five orders of magnitude through twelve
+			// fixed boundaries. Native histograms allocate resolution where the
+			// data actually is, so the healthy microsecond range stays readable
+			// instead of collapsing into the first bucket the moment you widen
+			// the classic boundaries far enough to cover the saturated case.
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
 		}),
 
 		acquireErrors: prometheus.NewCounter(prometheus.CounterOpts{
@@ -122,7 +133,40 @@ func NewDB(reg prometheus.Registerer, names map[string]string) *DB {
 	}
 
 	reg.MustRegister(d.queryDuration, d.queryErrors, d.acquireWait, d.acquireErrors)
+	d.preInit()
 	return d
+}
+
+// enumerableErrorKinds are the error kinds this package can name in advance.
+//
+// SQLSTATE codes cannot be pre-initialised — there are ~250 of them and creating
+// every one would be worse than the problem. These three are produced by
+// errorKind() itself rather than by Postgres, so they are a closed set we own.
+var enumerableErrorKinds = []string{"canceled", "timeout", "other"}
+
+// preInit creates the query metric series at zero, for the same reason
+// HTTP.PreInit does.
+//
+// orders_db_query_errors_total was missing from /metrics ENTIRELY until this
+// existed — a CounterVec with no children emits nothing at all, not even its
+// HELP and TYPE lines, and no query had ever failed. The dashboard panel read
+// "No data", which looks identical to a broken panel, and is the opposite of
+// what you want to see on a healthy service: a flat line at zero.
+//
+// It was found by scripts/check_dashboards.py, which flagged the metric name as
+// unknown to Prometheus. That is the whole reason that check exists.
+func (d *DB) preInit() {
+	for _, name := range d.names {
+		d.queryDuration.WithLabelValues(name, "ok")
+		d.queryDuration.WithLabelValues(name, "error")
+		for _, kind := range enumerableErrorKinds {
+			d.queryErrors.WithLabelValues(name, kind)
+		}
+	}
+	// Queries not in the name map are labelled "other"; that series should
+	// exist too, or its first appearance looks like a new metric.
+	d.queryDuration.WithLabelValues("other", "ok")
+	d.queryDuration.WithLabelValues("other", "error")
 }
 
 // --- pgx.QueryTracer -------------------------------------------------------
@@ -151,10 +195,13 @@ func (d *DB) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQuery
 	if isRealError(data.Err) {
 		status = "error"
 	}
-	d.queryDuration.WithLabelValues(v.name, status).Observe(time.Since(v.start).Seconds())
+	// ctx here is the one the query ran under, so it carries whatever span was
+	// active — the HTTP server span for a request, the worker.batch span for
+	// background work. Either way the trace ID is the right one to point at.
+	observeExemplar(ctx, d.queryDuration.WithLabelValues(v.name, status), time.Since(v.start).Seconds())
 
 	if status == "error" {
-		d.queryErrors.WithLabelValues(v.name, errorKind(data.Err)).Inc()
+		addExemplar(ctx, d.queryErrors.WithLabelValues(v.name, errorKind(data.Err)), 1)
 	}
 }
 
@@ -171,9 +218,9 @@ func (d *DB) TraceAcquireEnd(ctx context.Context, _ *pgxpool.Pool, data pgxpool.
 	if !ok {
 		return
 	}
-	d.acquireWait.Observe(time.Since(start).Seconds())
+	observeExemplar(ctx, d.acquireWait, time.Since(start).Seconds())
 	if data.Err != nil {
-		d.acquireErrors.Inc()
+		addExemplar(ctx, d.acquireErrors, 1)
 	}
 }
 
@@ -205,15 +252,7 @@ func isRealError(err error) bool {
 	return !errors.Is(err, pgx.ErrNoRows)
 }
 
-// errorKind produces a bounded label.
-//
-// PostgreSQL SQLSTATE codes are a CLOSED SET defined by the SQL standard and
-// the Postgres docs — roughly 250 five-character codes, and any one service
-// will realistically produce a handful. That makes them safe as a label value,
-// and far more actionable than a boolean: 23505 (unique violation) is a
-// client bug, 40001 (serialization failure) means retry, 53300 (too many
-// connections) is an infrastructure problem. Three completely different
-// responses that "error" alone cannot distinguish.
+
 func errorKind(err error) string {
 	switch {
 	case err == nil:

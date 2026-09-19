@@ -64,12 +64,14 @@ type fakeMetrics struct {
 	transitions map[[2]string]int
 	processed   map[string]int
 	runs        []recordedRun
+	panics      map[string]int
 }
 
 func newFakeMetrics() *fakeMetrics {
 	return &fakeMetrics{
 		transitions: map[[2]string]int{},
 		processed:   map[string]int{},
+		panics:      map[string]int{},
 	}
 }
 
@@ -79,16 +81,30 @@ func (f *fakeMetrics) Transition(from, to string) {
 	f.transitions[[2]string{from, to}]++
 }
 
-func (f *fakeMetrics) OrderProcessed(outcome string, _ time.Duration) {
+// The context argument exists only so the real implementation can attach a
+// trace exemplar; nothing here needs it.
+func (f *fakeMetrics) OrderProcessed(_ context.Context, outcome string, _ time.Duration) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.processed[outcome]++
 }
 
-func (f *fakeMetrics) WorkerRun(result string, size int, _ time.Duration) {
+func (f *fakeMetrics) WorkerRun(_ context.Context, result string, size int, _ time.Duration) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.runs = append(f.runs, recordedRun{result, size})
+}
+
+func (f *fakeMetrics) WorkerPanic(stage string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.panics[stage]++
+}
+
+func (f *fakeMetrics) panicCount(stage string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.panics[stage]
 }
 
 func order() domain.Order {
@@ -302,5 +318,63 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("Run did not return after context cancellation")
+	}
+}
+
+// TestPanicInProcessorIsRecoveredAndCounted.
+//
+// Before guard(), a panic here unwound past Run() and killed the entire
+// process — API included. That failure has no metric of its own: the worker
+// simply stops, which is exactly the silent death this package's doc warns
+// about.
+func TestPanicInProcessorIsRecoveredAndCounted(t *testing.T) {
+	st := newFakeStore()
+	st.pending = []domain.Order{order()}
+	m := newFakeMetrics()
+
+	w := New(st, m, testLogger(), Config{}).
+		WithProcessor(func(context.Context, domain.Order) (domain.Status, error) {
+			panic("payment gateway client exploded")
+		})
+
+	// The assertion is that this line returns at all.
+	w.runOnce(context.Background())
+
+	if got := m.panicCount("process_order"); got != 1 {
+		t.Errorf("panics{stage=process_order} = %d, want 1", got)
+	}
+}
+
+// One poison order must cost you that order, not the rest of the batch. This is
+// why guard() sits on processOne and not only on runOnce.
+func TestPanicInOneOrderDoesNotAbortTheBatch(t *testing.T) {
+	st := newFakeStore()
+	orders := []domain.Order{order(), order(), order()}
+	st.pending = orders
+	m := newFakeMetrics()
+
+	poison := orders[0].ID
+	w := New(st, m, testLogger(), Config{BatchSize: 10}).
+		WithProcessor(func(_ context.Context, o domain.Order) (domain.Status, error) {
+			if o.ID == poison {
+				panic("bad row")
+			}
+			return domain.StatusPaid, nil
+		})
+
+	w.runOnce(context.Background())
+
+	if got := m.panicCount("process_order"); got != 1 {
+		t.Fatalf("panics = %d, want 1", got)
+	}
+	for _, o := range orders[1:] {
+		if st.marked[o.ID] != domain.StatusPaid {
+			t.Errorf("order %s = %q, want paid; the panic aborted the batch",
+				o.ID, st.marked[o.ID])
+		}
+	}
+	// The batch itself still completed, so the heartbeat must not have a hole.
+	if len(m.runs) != 1 || m.runs[0].result != "ok" {
+		t.Errorf("runs = %v, want one ok run", m.runs)
 	}
 }

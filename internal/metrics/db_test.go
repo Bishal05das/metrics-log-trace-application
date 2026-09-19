@@ -105,16 +105,66 @@ func TestTraceQueryRecordsDurationAndStatus(t *testing.T) {
 	ctx = d.TraceQueryStart(context.Background(), nil, pgx.TraceQueryStartData{SQL: "SELECT 1"})
 	d.TraceQueryEnd(ctx, nil, pgx.TraceQueryEndData{Err: &pgconn.PgError{Code: "23505"}})
 
-	if n := testutil.CollectAndCount(reg, "orders_db_query_duration_seconds"); n != 2 {
-		t.Errorf("want 2 duration series (ok + error), got %d", n)
+	// Series COUNT is no longer the right assertion: preInit creates the known
+	// label combinations at zero so the metric exists before the first query.
+	// Assert on what was actually OBSERVED instead.
+	if got := histCount(t, reg, "orders_db_query_duration_seconds", "select_one", "ok"); got != 2 {
+		t.Errorf("ok observations = %v, want 2 (success + ErrNoRows)", got)
 	}
 	if got := testutil.ToFloat64(d.queryErrors.WithLabelValues("select_one", "23505")); got != 1 {
 		t.Errorf("unique-violation counter = %v, want 1", got)
 	}
-	// ErrNoRows must not have incremented any error series.
-	if n := testutil.CollectAndCount(reg, "orders_db_query_errors_total"); n != 1 {
-		t.Errorf("want exactly 1 error series, got %d", n)
+	// ErrNoRows must not have incremented ANY error series.
+	if got := nonZeroSeries(t, reg, "orders_db_query_errors_total"); got != 1 {
+		t.Errorf("want exactly 1 non-zero error series, got %d", got)
 	}
+}
+
+// histCount returns the observation count of one labelled histogram series.
+func histCount(t *testing.T, g prometheus.Gatherer, name string, labelValues ...string) uint64 {
+	t.Helper()
+	families, err := g.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			got := make([]string, 0, len(m.GetLabel()))
+			for _, l := range m.GetLabel() {
+				got = append(got, l.GetValue())
+			}
+			if strings.Join(got, "\x00") == strings.Join(labelValues, "\x00") {
+				return m.GetHistogram().GetSampleCount()
+			}
+		}
+	}
+	t.Fatalf("no %s series with labels %v", name, labelValues)
+	return 0
+}
+
+// nonZeroSeries counts the series of a metric family whose value is not zero,
+// so pre-initialised placeholders do not confuse a behavioural assertion.
+func nonZeroSeries(t *testing.T, g prometheus.Gatherer, name string) int {
+	t.Helper()
+	families, err := g.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	n := 0
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			if m.GetCounter().GetValue() != 0 {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // TestTraceQueryEndWithoutStart guards against a panic if the context is lost.
@@ -124,8 +174,10 @@ func TestTraceQueryEndWithoutStart(t *testing.T) {
 
 	d.TraceQueryEnd(context.Background(), nil, pgx.TraceQueryEndData{})
 
-	if n := testutil.CollectAndCount(reg, "orders_db_query_duration_seconds"); n != 0 {
-		t.Errorf("End without Start should record nothing, got %d series", n)
+	// The pre-initialised "other" series exist, but nothing may have been
+	// OBSERVED into them.
+	if got := histCount(t, reg, "orders_db_query_duration_seconds", "other", "ok"); got != 0 {
+		t.Errorf("End without Start recorded %d observations, want 0", got)
 	}
 }
 
@@ -201,5 +253,36 @@ func TestDBLatencyBucketsAreFinerThanHTTP(t *testing.T) {
 	if DBLatencyBuckets[0] >= LatencyBuckets[0] {
 		t.Fatalf("db first bucket %v must be finer than http first bucket %v",
 			DBLatencyBuckets[0], LatencyBuckets[0])
+	}
+}
+
+// TestQueryMetricsExistBeforeAnyQuery.
+//
+// A CounterVec with no children emits NOTHING — not even its HELP and TYPE
+// lines. orders_db_query_errors_total was absent from /metrics entirely on a
+// healthy service, so the "Query errors by SQLSTATE" panel showed "No data"
+// (indistinguishable from a broken panel) instead of a flat line at zero.
+func TestQueryMetricsExistBeforeAnyQuery(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewDB(reg, map[string]string{"SELECT 1": "ping"})
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+
+	seen := map[string]int{}
+	for _, f := range families {
+		seen[f.GetName()] = len(f.GetMetric())
+	}
+
+	for _, name := range []string{
+		"orders_db_query_duration_seconds",
+		"orders_db_query_errors_total",
+	} {
+		if seen[name] == 0 {
+			t.Errorf("%s is absent from /metrics before the first query; "+
+				"dashboards will show 'No data' instead of zero", name)
+		}
 	}
 }

@@ -44,13 +44,25 @@ func run() error {
 		return err
 	}
 
+	// The registry is built FIRST — before the logger — because the logger
+	// reports its own volume into it. Everything that registers a metric gets
+	// this passed explicitly; no globals.
+	//
+	// Ordering here is load-bearing: build the logger first and there is no
+	// registry to hand it, so log volume silently goes unmeasured.
+	reg := metrics.New()
+	logMetrics := metrics.NewLogs(reg)
+
 	log, levelVar := logging.New(logging.Config{
-		Level:   cfg.LogLevel,
-		Format:  logging.Format(cfg.LogFormat),
-		Source:  cfg.LogSource,
-		Service: "orders",
-		Version: version,
-		Env:     cfg.Env,
+		Level:          cfg.LogLevel,
+		Format:         logging.Format(cfg.LogFormat),
+		Source:         cfg.LogSource,
+		Service:        "orders",
+		Version:        version,
+		Env:            cfg.Env,
+		SampleN:        cfg.LogSampleN,
+		SampleInterval: cfg.LogSampleInterval,
+		Recorder:       logMetrics,
 	})
 	//Replace the global default logger used by the log/slog package with your custom logger.
 	slog.SetDefault(log)
@@ -74,17 +86,12 @@ func run() error {
 		return err
 	}
 
-	// The registry is built first and passed explicitly to everything that
-	// needs to register a metric. No globals.
-	reg := metrics.New()
-	metrics.BuildInfo(reg, version, commit, runtime.Version(), cfg.Env)
+	metrics.BuildInfo(reg, version, commit, runtime.Version(), cfg.Env)  //Prometheus metric that exposes information about your application's build.
 
 	httpMetrics := metrics.NewHTTP(reg)
 	httpMetrics.PreInit(httpapi.InstrumentedRoutes...)
 
-	// One object serves as pgx.QueryTracer and pgxpool.AcquireTracer, so every
-	// query and every connection acquisition is instrumented without any store
-	// method having to remember to do it.
+	
 	dbMetrics := metrics.NewDB(reg, store.QueryNames())
 
 	statuses := make([]string, len(domain.AllStatuses))
@@ -94,13 +101,7 @@ func run() error {
 	bizMetrics := metrics.NewBusiness(reg, statuses)
 	bizMetrics.PreInit(domain.SupportedCurrencies, domain.AllTransitions)
 
-	// pgx has one tracer slot, so the metrics tracer and the query logger are
-	// composed. MultiTracer also forwards the acquire-tracing interface — drop
-	// that and the acquire-wait histogram silently stops recording.
-	// THREE independent observers on one pgx tracer slot, none aware of the
-	// others: metrics (aggregate), logs (per request), traces (where the time
-	// went). MultiTracer also forwards pgxpool.AcquireTracer, without which the
-	// acquire-wait histogram AND the db.acquire span both silently vanish.
+	
 	queryLogger := logging.NewQueryLogger(log, store.QueryNames(), cfg.SlowQueryThreshold)
 	queryTracer := tracing.NewQueryTracer(tp.Tracer, store.QueryNames())
 	tracer := store.MultiTracer{dbMetrics, queryLogger, queryTracer}

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -29,7 +30,15 @@ const (
 	codeMethodUnknown = "not_found"
 )
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+// writeJSON takes a context for one reason: the error path below.
+//
+// It used to call the package-level slog.Error, which passes
+// context.Background() — so ContextHandler had nothing to attach and this
+// single line came out with no request_id and no trace_id. It was the only
+// error in the whole request path you could not correlate, and it fires exactly
+// when a response is failing to reach the client, which is when you most want
+// to know which request it was.
+func writeJSON(ctx context.Context, w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	if v == nil {
@@ -37,10 +46,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	}
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		// The status line is already sent; all we can do is record it.
-		slog.Error("write json response", "error", err)
+		slog.ErrorContext(ctx, "write json response", "error", err)
 	}
 }
 
-func writeError(w http.ResponseWriter, status int, code, msg, field string) {
-	writeJSON(w, status, errorBody{Code: code, Message: msg, Field: field})
+func writeError(ctx context.Context, w http.ResponseWriter, status int, code, msg, field string) {
+	writeJSON(ctx, w, status, errorBody{Code: code, Message: msg, Field: field})
 }

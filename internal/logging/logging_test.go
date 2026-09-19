@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -209,7 +211,7 @@ func TestNewRequestIDIsUniqueAndHex(t *testing.T) {
 func TestSamplingDropsRepeatsButNeverWarnings(t *testing.T) {
 	buf := &bytes.Buffer{}
 	base := slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-	log := slog.New(NewSamplingHandler(base, 3, time.Hour))
+	log := slog.New(NewSamplingHandler(base, 3, time.Hour, nil))
 
 	for i := 0; i < 50; i++ {
 		log.Info("noisy")
@@ -238,7 +240,7 @@ func TestSamplingDropsRepeatsButNeverWarnings(t *testing.T) {
 func TestSamplingReportsDropCount(t *testing.T) {
 	buf := &bytes.Buffer{}
 	base := slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-	h := NewSamplingHandler(base, 1, 10*time.Millisecond)
+	h := NewSamplingHandler(base, 1, 10*time.Millisecond, nil)
 	log := slog.New(h)
 
 	for i := 0; i < 5; i++ {
@@ -266,4 +268,171 @@ func TestLevelVarChangesTakeEffectImmediately(t *testing.T) {
 	if buf.Len() == 0 {
 		t.Fatal("debug not emitted after level change")
 	}
+}
+
+// TestSamplingBudgetIsSharedAcrossDerivedLoggers.
+//
+// slog.Logger.With() calls WithAttrs, which returns a NEW handler. An earlier
+// version gave that new handler a fresh bucket map, so "3 per interval" quietly
+// became "3 per interval PER derived logger" — and since New() itself calls
+// .With(service, version, env), and call sites add more, the sampler would have
+// let a flood straight through the component built to stop it.
+func TestSamplingBudgetIsSharedAcrossDerivedLoggers(t *testing.T) {
+	buf := &bytes.Buffer{}
+	base := slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	root := slog.New(NewSamplingHandler(base, 3, time.Hour, nil))
+
+	a := root.With("component", "a")
+	b := root.With("component", "b")
+
+	for i := 0; i < 10; i++ {
+		a.Info("same message")
+		b.Info("same message")
+	}
+
+	if got := strings.Count(buf.String(), "same message"); got != 3 {
+		t.Errorf("emitted %d records, want 3 — the budget is not shared "+
+			"across handlers derived with With()", got)
+	}
+}
+
+// New() must actually install the sampler, and must leave WARN+ alone.
+func TestNewWiresSampling(t *testing.T) {
+	logger, _ := New(Config{Level: "debug", SampleN: 2, SampleInterval: time.Hour})
+	if logger == nil {
+		t.Fatal("New returned nil")
+	}
+
+	buf := &bytes.Buffer{}
+	base := slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	h := NewSamplingHandler(&ContextHandler{Handler: base}, 2, time.Hour, nil)
+	l := slog.New(h).With("service", "orders")
+
+	for i := 0; i < 5; i++ {
+		l.Info("chatty")
+		l.Warn("rare but important")
+	}
+
+	if got := strings.Count(buf.String(), "chatty"); got != 2 {
+		t.Errorf("INFO emitted %d times, want 2 (sampled)", got)
+	}
+	if got := strings.Count(buf.String(), "rare but important"); got != 5 {
+		t.Errorf("WARN emitted %d times, want 5 — WARN and above must never "+
+			"be sampled; dropping one loses information you cannot recover", got)
+	}
+}
+
+// Sampling must not break correlation: a record that survives still needs its
+// context attributes, which means ContextHandler has to stay in the chain
+// underneath the sampler.
+func TestSampledRecordsKeepContextAttrs(t *testing.T) {
+	buf := &bytes.Buffer{}
+	base := slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	l := slog.New(NewSamplingHandler(&ContextHandler{Handler: base}, 5, time.Hour, nil))
+
+	l.InfoContext(WithRequestID(context.Background(), "req-abc"), "hello")
+
+	if !strings.Contains(buf.String(), `"request_id":"req-abc"`) {
+		t.Errorf("context attrs lost under sampling: %s", buf.String())
+	}
+}
+
+// fakeRecorder counts calls, standing in for metrics.Logs.
+type fakeRecorder struct {
+	mu      sync.Mutex
+	records map[string]int
+	dropped map[string]int
+}
+
+func newFakeRecorder() *fakeRecorder {
+	return &fakeRecorder{records: map[string]int{}, dropped: map[string]int{}}
+}
+
+func (f *fakeRecorder) LogRecord(level string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.records[level]++
+}
+
+func (f *fakeRecorder) LogRecordDropped(level string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dropped[level]++
+}
+
+// TestRecorderCountsAttemptsNotSurvivors.
+//
+// countingHandler must sit OUTSIDE the sampler. Inside, orders_log_records_total
+// would count only the records that survived, the drop RATIO would always be
+// zero, and the alert built on it could never fire.
+func TestRecorderCountsAttemptsNotSurvivors(t *testing.T) {
+	rec := newFakeRecorder()
+	buf := &bytes.Buffer{}
+	base := slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+
+	var h slog.Handler = NewSamplingHandler(&ContextHandler{Handler: base}, 2, time.Hour, rec)
+	h = &countingHandler{Handler: h, rec: rec}
+	l := slog.New(h)
+
+	for i := 0; i < 10; i++ {
+		l.Info("chatty")
+	}
+
+	if got := rec.records["INFO"]; got != 10 {
+		t.Errorf("records counted = %d, want 10 (every ATTEMPT, not just survivors)", got)
+	}
+	if got := rec.dropped["INFO"]; got != 8 {
+		t.Errorf("dropped counted = %d, want 8", got)
+	}
+	if got := strings.Count(buf.String(), "chatty"); got != 2 {
+		t.Errorf("emitted = %d, want 2", got)
+	}
+}
+
+// Counting must survive logger.With(), the classic slog wrapper bug.
+func TestRecorderSurvivesWith(t *testing.T) {
+	rec := newFakeRecorder()
+	base := slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})
+	l := slog.New(&countingHandler{Handler: base, rec: rec}).With("component", "x")
+
+	l.Info("hello")
+	l.WithGroup("g").Warn("grouped")
+
+	if rec.records["INFO"] != 1 || rec.records["WARN"] != 1 {
+		t.Errorf("counting stopped after With/WithGroup: %v", rec.records)
+	}
+}
+
+// WARN and above are never sampled, so they must never be counted as dropped.
+func TestWarningsAreNeverDropped(t *testing.T) {
+	rec := newFakeRecorder()
+	base := slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})
+	var h slog.Handler = NewSamplingHandler(base, 1, time.Hour, rec)
+	h = &countingHandler{Handler: h, rec: rec}
+	l := slog.New(h)
+
+	for i := 0; i < 5; i++ {
+		l.Error("boom")
+	}
+
+	if got := rec.dropped["ERROR"]; got != 0 {
+		t.Errorf("dropped %d ERROR records; WARN and above must never be sampled", got)
+	}
+	if got := rec.records["ERROR"]; got != 5 {
+		t.Errorf("counted %d ERROR records, want 5", got)
+	}
+}
+
+// New() must wire the Recorder through; nil must remain safe.
+func TestNewWiresRecorder(t *testing.T) {
+	rec := newFakeRecorder()
+	l, _ := New(Config{Level: "debug", SampleN: 100, SampleInterval: time.Hour, Recorder: rec})
+	l.Info("wired")
+	if rec.records["INFO"] == 0 {
+		t.Error("New did not install the Recorder")
+	}
+
+	// nil Recorder must not panic.
+	l2, _ := New(Config{Level: "debug", SampleN: 100, SampleInterval: time.Hour})
+	l2.Info("no recorder")
 }

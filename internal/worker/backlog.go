@@ -2,7 +2,9 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"time"
 
 	"github.com/bishal05das/metrics-log-trace-application/internal/domain"
@@ -18,6 +20,11 @@ type BacklogStore interface {
 type BacklogMetrics interface {
 	SetBacklog(counts map[string]int64, oldest time.Duration)
 	BacklogRefreshFailed()
+
+	// WorkerPanic counts a recovered panic. Same method as worker.Metrics —
+	// *metrics.Business satisfies both, so a panic anywhere in the background
+	// lands on one counter that a single alert can watch.
+	WorkerPanic(stage string)
 }
 
 // BacklogRefresher periodically publishes the absolute backlog.
@@ -92,6 +99,20 @@ func (b *BacklogRefresher) Run(ctx context.Context) {
 func (b *BacklogRefresher) refresh(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
+
+	// Same net as the worker's guard(): this runs on its own goroutine, so an
+	// unrecovered panic here would take the whole process down. Without a
+	// counter it would also be invisible — the backlog gauges would simply
+	// freeze at their last value, which reads as a calm, stable backlog.
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		b.metrics.WorkerPanic(StageBacklog)
+		b.log.ErrorContext(ctx, "recovered panic in backlog refresher",
+			"stage", StageBacklog, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+	}()
 
 	counts, err := b.store.CountOrdersByStatus(ctx)
 	if err != nil {

@@ -1,0 +1,22 @@
+# Logstash node settings. The PIPELINE lives in pipeline/orders.conf.
+
+# Binds the monitoring API on :9600 — /_node/stats is how you answer "is the
+# pipeline actually moving?" without opening Kibana. See `make elk-health`.
+#
+# Set ONLY api.http.host. `http.host` is its deprecated alias and 8.x refuses to
+# start when both are present ("Both `api.http.host` and its deprecated alias
+# `http.host` have been set") rather than picking one.
+api.http.host: 0.0.0.0
+
+# Stack Monitoring ships Logstash's own metrics into Elasticsearch. Off here:
+# it writes to indices we do not template or curate, and this project already
+# watches pipeline health from Prometheus's side.
+xpack.monitoring.enabled: false
+
+log.level: info
+
+# Batch tuning. 125 events per worker batch is the default and is right for a
+# service at this volume — raising it trades latency for throughput, and log
+# latency matters during an incident.
+pipeline.batch.size: 125
+pipeline.batch.delay: 50

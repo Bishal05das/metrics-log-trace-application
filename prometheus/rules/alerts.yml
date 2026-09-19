@@ -248,6 +248,47 @@ groups:
           description: "The backlog refresher has not updated in {{ $value | humanizeDuration }}. Backlog gauges are frozen and the alerts based on them are blind."
           runbook_url: "https://runbooks.internal/orders/backlog-stale"
 
+      # OrdersBacklogMetricsStale above catches the refresher when it stops
+      # ENTIRELY. This catches it while it is still running and failing, which
+      # is both more common and easier to miss: each attempt errors, the
+      # timestamp never advances, and — because a failed refresh deliberately
+      # leaves the previous gauge values in place rather than zeroing them —
+      # the dashboard keeps showing a plausible, frozen backlog.
+      #
+      # It fires ~1m before the staleness alert (2 failures at a 15s interval,
+      # for 1m) because it names the actual cause. "Backlog refreshes are
+      # failing" sends you to the database; "backlog metrics are stale" only
+      # tells you a number stopped moving.
+      - alert: OrdersBacklogRefreshFailing
+        expr: increase(orders_backlog_refresh_errors_total[5m]) > 2
+        for: 1m
+        labels:
+          severity: warning
+          service: orders
+        annotations:
+          summary: "backlog refresh is failing ({{ $value | printf \"%.0f\" }} errors in 5m)"
+          description: "The backlog refresher is running but its queries are failing. The backlog gauges are frozen at their last values and every alert based on them is blind."
+          runbook_url: "https://runbooks.internal/orders/backlog-refresh-failing"
+
+      # A recovered panic in a background goroutine.
+      #
+      # Any value above zero is worth waking up for. Unlike an HTTP panic — which
+      # the recovery middleware turns into a 500 the caller sees — this one has
+      # no external symptom at all: the batch is silently abandoned, its orders
+      # stay in `processing`, and every RED metric stays green. The `stage`
+      # label separates "one order is poison" (process_order) from "the claim
+      # query is broken" (batch) from "the backlog refresher is broken".
+      - alert: OrdersWorkerPanics
+        expr: increase(orders_worker_panics_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: "background worker panicked in stage {{ $labels.stage }}"
+          description: "{{ $value | printf \"%.0f\" }} recovered panic(s) in the {{ $labels.stage }} stage. Before recovery existed this crashed the whole process; now it silently abandons work. Check the stack trace in the logs."
+          runbook_url: "https://runbooks.internal/orders/worker-panic"
+
       - alert: OrdersPaymentFailureRateHigh
         expr: job:orders_payment_failure:ratio_rate5m > 0.25
         for: 5m
@@ -260,6 +301,162 @@ groups:
           runbook_url: "https://runbooks.internal/orders/payment-failures"
 
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # The LOGS pipeline, alerted on from the METRICS pillar.
+  #
+  # None of these can be written in Elasticsearch, and that is the point: a
+  # store cannot alert you that it stopped being written to. The observer has to
+  # be a different system from the observed.
+  # ---------------------------------------------------------------------------
+  - name: orders_logs
+    rules:
+      # THE alert for this pillar.
+      #
+      # Everything else about logging fails loudly — a crashed Logstash, a red
+      # cluster. This one catches the quiet failure: every container is up and
+      # healthy, and nothing is arriving. A parse error, a mapping conflict, a
+      # full sincedb, a changed log path. The dashboard stays green and you
+      # discover it during the next incident, when you go to read the lines and
+      # there are none.
+      #
+      # The `and` clause is load-bearing. Without it this fires every night on
+      # an idle service, and an alert that cries wolf gets muted, which is
+      # strictly worse than not having it.
+      - alert: OrdersLogShippingStopped
+        expr: |
+          increase(
+            sum(elasticsearch_indices_docs_primary{index=~"orders-logs-.*"})[10m:1m]
+          ) == 0
+          and
+          sum(rate(orders_http_requests_total[10m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: "no logs have reached Elasticsearch in 10 minutes"
+          description: "The service is serving traffic but the orders-logs-* indices have not grown. Logs are being written and lost somewhere between the container and Elasticsearch. Check `make elk-health` and the Logstash container logs."
+          runbook_url: "https://runbooks.internal/orders/log-shipping-stopped"
+
+      # A red cluster means shards are unassigned and writes are failing or
+      # about to. Yellow is EXPECTED on a single node — replicas cannot be
+      # allocated with nowhere to put them — so alerting on "not green" here
+      # would fire forever in this setup and teach you to ignore it.
+      - alert: OrdersElasticsearchUnhealthy
+        expr: elasticsearch_cluster_health_status{color="red"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: "Elasticsearch cluster {{ $labels.cluster }} is RED"
+          description: "Primary shards are unassigned. Log ingestion is failing or will begin failing; new documents may be rejected."
+          runbook_url: "https://runbooks.internal/orders/elasticsearch-red"
+
+      - alert: OrdersElasticsearchDown
+        expr: elasticsearch_up == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: "the Elasticsearch exporter cannot reach Elasticsearch"
+          description: "Either Elasticsearch is down or the exporter cannot talk to it. Logs are accumulating in Docker's json-file driver and will be lost when those files rotate."
+          runbook_url: "https://runbooks.internal/orders/elasticsearch-down"
+
+      # Sampling is a cost control, not a normal operating mode. A sustained
+      # non-zero drop rate means a hot path is logging far more than intended —
+      # worth a ticket, never a page.
+      #
+      # This reads orders_log_records_* , counted inside the application BEFORE
+      # sampling. An earlier version had to infer it from Elasticsearch document
+      # counts, which was doubly wrong: it measured the pillar from downstream
+      # of itself (so a shipping outage erased the measurement), and it could
+      # not separate "we are logging more" from "we are shipping more of what we
+      # already logged".
+      - alert: OrdersLogSamplingPressure
+        expr: |
+          sum(rate(orders_log_records_dropped_total[10m]))
+          / clamp_min(sum(rate(orders_log_records_total[10m])), 1e-9)
+          > 0.2
+        for: 15m
+        labels:
+          severity: warning
+          service: orders
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of log records are being dropped"
+          description: "The sampler is discarding a sustained fraction of records, which means something is logging far above the {{ with printf \"1\" }}{{ end }}configured budget. Find the message with `orders: errors and warnings` in Kibana, or aggregate on message.keyword. Dropped lines are counted, not lost silently — but they are not in Elasticsearch either."
+          runbook_url: "https://runbooks.internal/orders/log-sampling-pressure"
+
+      # DEBUG left on after an incident is the most common way a log bill
+      # doubles overnight. The runtime level switch that makes debugging easy
+      # (`make log-level L=debug`) is exactly what makes this easy to forget,
+      # so the switch needs a matching alarm.
+      - alert: OrdersDebugLoggingLeftOn
+        expr: sum(rate(orders_log_records_total{level="DEBUG"}[15m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+          service: orders
+        annotations:
+          summary: "DEBUG logging has been on for 30 minutes"
+          description: "The service is emitting DEBUG records. That is correct during an investigation and expensive afterwards — every line is stored and indexed. Turn it back down with `make log-level L=info`."
+          runbook_url: "https://runbooks.internal/orders/debug-left-on"
+
+  # ---------------------------------------------------------------------------
+  # The TRACES pipeline. Same principle as orders_logs above.
+  # ---------------------------------------------------------------------------
+  - name: orders_traces
+    rules:
+      # The quiet failure, one pillar over. Every container healthy, requests
+      # being served, and no spans arriving — a misconfigured endpoint, a
+      # rejected batch, a full queue. Nothing about it is visible in the API's
+      # own metrics, and you discover it when you open Jaeger during an incident
+      # and the trace you need is not there.
+      #
+      # `saved`, not `received`: received proves the collector got the spans,
+      # saved proves Elasticsearch accepted them.
+      - alert: OrdersTraceIngestionStopped
+        expr: |
+          sum(rate(jaeger_collector_spans_saved_by_svc_total{svc="orders",result="ok"}[10m])) == 0
+          and
+          sum(rate(orders_http_requests_total[10m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: "no spans have reached Jaeger in 10 minutes"
+          description: "The service is serving traffic but no spans are being saved. Traces are being produced and lost between the application's BatchSpanProcessor and Elasticsearch. Check the api container for OTLP export errors and `make trace-health`."
+          runbook_url: "https://runbooks.internal/orders/trace-ingestion-stopped"
+
+      # Dropped spans mean the collector's queue overflowed — it is receiving
+      # faster than storage accepts. Unlike log sampling, this loss is NOT
+      # deliberate and NOT recorded anywhere in the data: the trace simply has a
+      # hole in it, which is worse than having no trace, because an incomplete
+      # waterfall reads as a complete one.
+      - alert: OrdersTraceSpansDropped
+        expr: increase(jaeger_collector_spans_dropped_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: orders
+        annotations:
+          summary: "Jaeger dropped {{ $value | printf \"%.0f\" }} spans in 10 minutes"
+          description: "The collector queue overflowed. Traces will have missing spans, and a waterfall with a hole in it looks identical to a complete one. Raise the queue size, scale the collector, or lower TRACING_SAMPLE_RATIO."
+          runbook_url: "https://runbooks.internal/orders/trace-spans-dropped"
+
+      - alert: OrdersJaegerDown
+        expr: up{job="jaeger"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: orders
+        annotations:
+          summary: "Jaeger is not being scraped"
+          description: "Either Jaeger is down or Prometheus cannot reach it. Spans are buffering in the application's BatchSpanProcessor and will be dropped when that queue fills."
+          runbook_url: "https://runbooks.internal/orders/jaeger-down"
+
   - name: orders_runtime
     rules:
       - alert: OrdersFileDescriptorsExhausting

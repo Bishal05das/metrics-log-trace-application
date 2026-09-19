@@ -39,6 +39,16 @@ type Config struct {
 	// makes it affordable to always log them.
 	SlowQueryThreshold time.Duration
 
+	// LogSampleN caps DEBUG/INFO records per distinct message per
+	// LogSampleInterval. WARN and above are never sampled.
+	//
+	// Defaults to 50/s: high enough that ordinary traffic is untouched, low
+	// enough that a runaway loop cannot bury the one line that matters — or
+	// bankrupt you once these lines are being indexed by Elasticsearch, where
+	// every field of every document costs storage and CPU. Set to 0 to disable.
+	LogSampleN        int
+	LogSampleInterval time.Duration
+
 	// Tracing. Defaults to the stdout exporter so traces are visible with no
 	// backend running; point OTEL_EXPORTER at "otlp" once you have one.
 	TracingEnabled      bool
@@ -95,6 +105,14 @@ func Load() (Config, error) {
 	}
 	if cfg.BacklogInterval, err = envDuration("BACKLOG_INTERVAL", 15*time.Second); err != nil {
 		return Config{}, err
+	}
+	if cfg.LogSampleInterval, err = envDuration("LOG_SAMPLE_INTERVAL", time.Second); err != nil {
+		return Config{}, err
+	}
+	if n, err := envInt32("LOG_SAMPLE_N", 50); err != nil {
+		return Config{}, err
+	} else {
+		cfg.LogSampleN = int(n)
 	}
 	if n, err := envInt32("WORKER_BATCH_SIZE", 20); err != nil {
 		return Config{}, err

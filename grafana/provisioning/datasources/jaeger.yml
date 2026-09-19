@@ -1,0 +1,65 @@
+apiVersion: 1
+
+# Jaeger as a Grafana datasource, alongside its own UI on :16687.
+#
+# Two UIs again, for the same reason as Kibana and Grafana on the logs side:
+# Jaeger's UI is the better place to EXPLORE a trace (the service dependency
+# graph, span search, trace comparison have no equivalent here), and Grafana is
+# where traces connect to the other two pillars — an exemplar on a latency
+# histogram, a trace_id on a log line.
+datasources:
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    uid: jaeger
+    # Container-to-container, so Jaeger's INTERNAL query port (16686), not the
+    # shifted host mapping (16687).
+    url: http://jaeger:16686
+    editable: false
+    jsonData:
+      # TRACES → LOGS.
+      #
+      # Opens the Elasticsearch datasource filtered to this trace, so a slow
+      # span becomes the log lines emitted during it. The join key is trace_id,
+      # which exists on every log line because tracing.Middleware puts it on the
+      # logging context — see internal/tracing/http.go.
+      tracesToLogsV2:
+        datasourceUid: elasticsearch
+        # A trace's logs are written while the trace runs, but the span you
+        # clicked may be milliseconds long. Widening the window by a second
+        # either side is the difference between finding the lines and finding
+        # nothing.
+        spanStartTimeShift: "-1s"
+        spanEndTimeShift: "1s"
+        filterByTraceID: false
+        filterBySpanID: false
+        # customQuery is required because Elasticsearch is not one of the
+        # datasources Grafana can auto-generate a query for.
+        customQuery: true
+        query: 'trace_id:"$${__span.traceId}"'
+
+      # TRACES → METRICS.
+      #
+      # From one slow span to the aggregate behaviour of that route: is this
+      # request unlucky, or is the whole endpoint degraded? That question is the
+      # entire reason the two pillars share a `route` label value.
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        tags:
+          - key: "http.route"
+            value: "route"
+        queries:
+          - name: "Request rate for this route"
+            query: 'sum(rate(orders_http_requests_total{$$__tags}[5m]))'
+          - name: "p99 latency for this route"
+            query: 'histogram_quantile(0.99, sum by (le) (rate(orders_http_request_duration_seconds_bucket{$$__tags}[5m])))'
+
+      # Node graph and span-level metrics in the trace view.
+      nodeGraph:
+        enabled: true
+      traceQuery:
+        timeShiftEnabled: true
+        spanStartTimeShift: "-1h"
+        spanEndTimeShift: "1h"

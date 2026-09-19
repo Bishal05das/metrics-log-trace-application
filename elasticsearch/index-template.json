@@ -1,0 +1,76 @@
+{
+  "index_patterns": ["orders-logs-*"],
+  "priority": 200,
+  "_meta": {
+    "description": "Field mappings for the orders service log stream. Applied by scripts/elk_init.sh before Logstash writes its first document — a mapping created AFTER data exists cannot be changed without reindexing.",
+    "managed_by": "metrics-log-trace-application",
+    "note_on_message": "message is text (full-text search) PLUS a keyword subfield (aggregation). That pair is Elasticsearch's default for strings, and the dynamic_template above switches it off everywhere else deliberately: a keyword subfield on trace_id is pure waste, because you filter by a trace ID, you never group by one. slog messages are the opposite — static, low-cardinality strings — and 'which message is flooding my index?' is the first question asked when the bill jumps. Keep the subfield exactly where you aggregate.",
+    "note_on_comments": "Arbitrary keys belong HERE, not in properties. Anything added under properties is parsed as a FIELD MAPPING, and a string there fails the whole template with 'Expected map for property [fields]'."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "index.lifecycle.name": "orders-logs-policy",
+      "index.refresh_interval": "5s",
+      "index.mapping.total_fields.limit": 200
+    },
+    "mappings": {
+      "dynamic_templates": [
+        {
+          "strings_as_keyword": {
+            "match_mapping_type": "string",
+            "mapping": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        }
+      ],
+      "properties": {
+        "@timestamp": { "type": "date" },
+
+        "message": {
+          "type": "text",
+          "fields": {
+            "keyword": { "type": "keyword", "ignore_above": 256 }
+          }
+        },
+
+        "level": { "type": "keyword" },
+        "service": { "type": "keyword" },
+        "version": { "type": "keyword" },
+        "env": { "type": "keyword" },
+
+        "trace_id": { "type": "keyword" },
+        "span_id": { "type": "keyword" },
+        "request_id": { "type": "keyword" },
+
+        "route": { "type": "keyword" },
+        "method": { "type": "keyword" },
+        "status": { "type": "short" },
+        "duration_ms": { "type": "float" },
+        "bytes": { "type": "long" },
+
+        "remote_addr": { "type": "ip", "ignore_malformed": true },
+        "user_agent": { "type": "keyword", "ignore_above": 512 },
+
+        "error": { "type": "text" },
+        "query": { "type": "keyword" },
+        "rows": { "type": "long" },
+        "sqlstate": { "type": "keyword" },
+
+        "order_id": { "type": "keyword" },
+        "customer_id": { "type": "keyword" },
+        "currency": { "type": "keyword" },
+
+        "stage": { "type": "keyword" },
+        "panic": { "type": "text" },
+        "stack": { "type": "text", "index": false },
+
+        "sampled_dropped": { "type": "integer" },
+        "source": { "type": "keyword" }
+      }
+    }
+  }
+}

@@ -77,7 +77,7 @@ func NewRouter(d Deps, mw ...Middleware) http.Handler {
 	// path matches this pattern, so r.Pattern is "/" rather than empty, and
 	// routeLabel() folds it into the single "unmatched" series.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, http.StatusNotFound, codeMethodUnknown, "no such endpoint", "")
+		writeError(r.Context(), w, http.StatusNotFound, codeMethodUnknown, "no such endpoint", "")
 	})
 
 	return chain(mux, mw...)

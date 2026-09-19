@@ -30,11 +30,15 @@ up: ## Start the whole stack (app + postgres + prometheus + alertmanager + grafa
 	@echo "waiting for postgres..."
 	@until docker compose exec -T postgres pg_isready -U orders -d orders >/dev/null 2>&1; do sleep 1; done
 	@echo
+	@ES_URL=$(ES_URL) KIBANA_URL=$(KIBANA_URL) bash scripts/elk_init.sh || true
+	@echo
 	@echo "  API           $(API_URL)"
 	@echo "  metrics       $(METRICS_URL)/metrics"
 	@echo "  Prometheus    $(PROM_URL)"
 	@echo "  Alertmanager  $(AM_URL)"
 	@echo "  Grafana       $(GRAFANA_URL)"
+	@echo "  Kibana        $(KIBANA_URL)/app/discover"
+	@echo "  Elasticsearch $(ES_URL)"
 	@echo
 	@echo "  run 'make alertsink' in another terminal to watch alerts arrive"
 
@@ -65,9 +69,86 @@ logs-pretty: ## Tail the app logs, one readable line each
 	@docker compose logs -f --no-log-prefix api 2>/dev/null | python3 scripts/prettylog.py
 
 .PHONY: traces
-traces: ## Render recent traces as a waterfall (TRACE=<id> for one)
+traces: ## Slowest recent traces from Jaeger (alias for traces-slow)
+	@python3 scripts/traces.py slow $(JAEGER_URL) '$(OP)'
+
+.PHONY: traces-stdout
+traces-stdout: ## Parse spans from container logs — only for OTEL_EXPORTER=stdout
 	@docker compose logs api --since $(or $(SINCE),2m) --no-log-prefix 2>/dev/null \
 		| python3 scripts/waterfall.py $(TRACE)
+
+# --- ELK: the logs backend ---------------------------------------------------
+ES_URL     ?= http://localhost:9201
+KIBANA_URL ?= http://localhost:5602
+LS_URL     ?= http://localhost:9601
+
+.PHONY: elk
+elk: ## Start Elasticsearch + Logstash + Kibana and apply mappings
+	docker compose up -d elasticsearch logstash kibana
+	@ES_URL=$(ES_URL) KIBANA_URL=$(KIBANA_URL) bash scripts/elk_init.sh
+
+.PHONY: elk-init
+elk-init: ## (Re)apply the ILM policy, index template and Kibana data view
+	@ES_URL=$(ES_URL) KIBANA_URL=$(KIBANA_URL) bash scripts/elk_init.sh
+
+.PHONY: elk-health
+elk-health: ## Is the log pipeline actually moving?
+	@python3 scripts/elk.py health $(ES_URL) $(LS_URL)
+
+.PHONY: kibana
+kibana: ## Open the Kibana Discover URL
+	@echo "$(KIBANA_URL)/app/discover"
+
+.PHONY: logs-es
+logs-es: ## Query shipped logs: make logs-es Q='level:ERROR' (default: last 20)
+	@python3 scripts/elk.py search $(ES_URL) '$(Q)'
+
+.PHONY: logs-trace
+logs-trace: ## Every shipped log line for one trace: make logs-trace T=<trace_id>
+	@python3 scripts/elk.py trace $(ES_URL) '$(T)'
+
+.PHONY: elk-mapping
+elk-mapping: ## Show how Elasticsearch actually mapped each field
+	@python3 scripts/elk.py mapping $(ES_URL)
+
+# --- Traces: Jaeger, storing into the same Elasticsearch ---------------------
+# Ports are shifted off Jaeger's defaults; another stack on this machine holds
+# 16686/4317/4318.
+JAEGER_URL       ?= http://localhost:16687
+JAEGER_ADMIN_URL ?= http://localhost:14269
+TRACE_RETAIN_DAYS ?= 3
+
+.PHONY: jaeger
+jaeger: ## Open the Jaeger UI URL
+	@echo "$(JAEGER_URL)"
+
+.PHONY: trace-health
+trace-health: ## Are spans reaching Jaeger, and is storage accepting them?
+	@python3 scripts/traces.py health $(JAEGER_ADMIN_URL) $(ES_URL)
+
+.PHONY: trace
+trace: ## Show one trace as a waterfall from Jaeger: make trace T=<trace_id>
+	@python3 scripts/traces.py show $(JAEGER_URL) '$(T)'
+
+.PHONY: traces-slow
+traces-slow: ## Slowest recent traces: make traces-slow [OP='POST /orders']
+	@python3 scripts/traces.py slow $(JAEGER_URL) '$(OP)'
+
+# Jaeger creates its OWN index templates for jaeger-span-*/jaeger-service-*, and
+# composable templates do not merge — a second template matching the same
+# pattern replaces Jaeger's mappings rather than adding a lifecycle policy to
+# them. So retention here is the official index cleaner, run on a schedule,
+# which is how Jaeger-on-Elasticsearch is actually operated. (The alternative is
+# ES_USE_ILM=true, which additionally needs rollover aliases and an init job.)
+COMPOSE_NETWORK ?= $(notdir $(CURDIR))_default
+
+.PHONY: jaeger-clean
+jaeger-clean: ## Delete trace indices older than TRACE_RETAIN_DAYS (default 3)
+	@echo "  deleting jaeger-* indices older than $(TRACE_RETAIN_DAYS) days"
+	@docker run --rm --network $(COMPOSE_NETWORK) \
+		-e ES_TLS_ENABLED=false \
+		jaegertracing/jaeger-es-index-cleaner:1.62.0 \
+		$(TRACE_RETAIN_DAYS) http://elasticsearch:9200
 
 .PHONY: log-level
 log-level: ## Get or set the runtime log level: make log-level L=debug

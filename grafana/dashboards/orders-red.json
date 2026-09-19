@@ -285,13 +285,14 @@
     {
       "type": "heatmap",
       "title": "Latency distribution (heatmap)",
-      "description": "The full histogram over time, not a percentile summary. Bimodal distributions — two distinct bands — are invisible in a p99 line and obvious here.",
+      "description": "The full histogram over time, not a percentile summary. Bimodal distributions — two distinct bands — are invisible in a p99 line and obvious here.\n\nExemplar diamonds mark individual requests, each carrying the trace_id of one real request that landed in that bucket. Click one in the top band: that is the path from \"the p99 is bad\" to the specific trace explaining why.",
       "gridPos": { "h": 9, "w": 10, "x": 14, "y": 16 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "refId": "A",
           "expr": "sum by (le) (rate(orders_http_request_duration_seconds_bucket{route=~\"$route\"}[5m]))",
+          "exemplar": true,
           "format": "heatmap",
           "legendFormat": "{{le}}"
         }
@@ -347,6 +348,7 @@
         {
           "refId": "A",
           "expr": "histogram_quantile(0.99, sum by (route, le) (rate(orders_http_response_size_bytes_bucket{route=~\"$route\"}[5m])))",
+          "exemplar": true,
           "legendFormat": "{{route}}"
         }
       ],
@@ -360,6 +362,86 @@
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
         "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Logs — the same incident, one scroll down",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Log volume by level",
+      "description": "From Prometheus, NOT Elasticsearch. Counted in the application before sampling, so this number survives the log pipeline being down — which is exactly when you want to know how much you are producing. A DEBUG line above zero means someone raised the level at runtime and did not put it back.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 35 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (level) (rate(orders_log_records_total[5m]))",
+          "legendFormat": "{{level}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(orders_log_records_dropped_total[5m]))",
+          "legendFormat": "dropped by sampler"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "dropped by sampler" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 6] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "ERROR" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "DEBUG" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "logs",
+      "title": "Errors and warnings (Elasticsearch)",
+      "description": "The point of this panel is that it shares the dashboard's TIME RANGE. Spot a spike on the latency graph above, and the lines explaining it are already on screen for that exact window — no switching tools, no re-entering the range in a second UI. Kibana is still the better place to explore; this is the place to correlate.",
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 35 },
+      "datasource": { "type": "elasticsearch", "uid": "elasticsearch" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "elasticsearch", "uid": "elasticsearch" },
+          "query": "level:(ERROR OR WARN)",
+          "metrics": [{ "id": "1", "type": "logs", "settings": { "limit": "100" } }],
+          "bucketAggs": [],
+          "timeField": "@timestamp"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
       }
     }
   ]

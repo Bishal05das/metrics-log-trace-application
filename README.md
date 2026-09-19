@@ -18,13 +18,24 @@ somewhere is a separate concern deliberately left for later.
 ## Quick start
 
 ```bash
-make up          # whole stack: app, postgres, prometheus, alertmanager, grafana
+make up          # whole stack: app, postgres, prometheus, alertmanager,
+                 # grafana, elasticsearch, logstash, kibana
 make load        # drive synthetic traffic
 make alertsink   # in another terminal: watch alerts arrive
 
 make logs-pretty            # tail the app logs, one readable line each
 make log-level              # read the current level
 make log-level L=debug      # raise it at runtime, no restart
+
+make elk-health             # is the log pipeline actually moving?
+make logs-es Q='level:ERROR'      # query shipped logs from the terminal
+make logs-trace T=<trace_id>      # every log line for one trace
+make elk-mapping            # how Elasticsearch actually mapped each field
+
+make trace-health           # are spans reaching Jaeger, and is storage taking them?
+make traces                 # slowest traces in the last hour
+make trace T=<trace_id>     # one trace as a waterfall
+make jaeger-clean           # delete trace indices older than 3 days
 ```
 
 | | URL |
@@ -34,6 +45,18 @@ make log-level L=debug      # raise it at runtime, no restart
 | Prometheus | http://localhost:9095 |
 | Alertmanager | http://localhost:9096 |
 | Grafana | http://localhost:3005 |
+| Kibana | http://localhost:5602 |
+| Elasticsearch | http://localhost:9201 |
+| Jaeger | http://localhost:16687 |
+
+Jaeger's ports are shifted off its defaults (16686/4317/4318) because another
+stack on this machine holds them; the app reaches the collector as `jaeger:4318`
+on the compose network, where the container port is unchanged.
+
+`make up` now starts a JVM stack (Elasticsearch, Logstash, Kibana) alongside the
+rest. Heaps are capped deliberately low — 512m ES, 256m Logstash — so the whole
+thing fits in roughly 2 GB. `make elk` starts just those three if you want the
+metrics stack on its own first.
 
 Ports are deliberately non-default so this stack never collides with anything
 else on the machine.
@@ -211,12 +234,126 @@ One structured line per request, plus DB queries at debug:
 - **Use the `*Context` variants.** `log.Info()` passes `context.Background()` and
   silently loses correlation. Do not use `WithGroup` on this logger — it nests
   `request_id` inside the group.
+- **Sampling is a cost control, in the application.** At most `LOG_SAMPLE_N`
+  (default 50) records per distinct message per `LOG_SAMPLE_INTERVAL` (default
+  1s); WARN and above are never sampled. Dropped lines are counted and the count
+  is attached to the next surviving record as `sampled_dropped`, so suppression
+  is never silent. Set `LOG_SAMPLE_N=0` to disable.
+
+  Measured under load: 2,999 requests produced 1,668 indexed access-log lines
+  plus 1,372 recorded drops — 45% suppressed, none of it invisible.
+
+- **Log volume is a METRIC, not just a log field.** `orders_log_records_total`
+  and `orders_log_records_dropped_total` (both by `level`) are counted in the
+  application *before* sampling. That placement is the point: `sampled_dropped`
+  only exists once a document has been written, shipped, parsed and indexed, so
+  the moment shipping breaks you lose the number describing your log volume
+  along with the logs. A counter upstream of all of it survives, and makes
+  volume alertable with the same `rate()` as everything else.
+
+  `internal/logging` never imports `internal/metrics` — it declares a
+  `Recorder` interface and `metrics.Logs` satisfies it, the same consumer-side
+  pattern as `metrics.PoolStats` and `worker.Store`.
+
+## Log aggregation (ELK)
+
+```
+app (JSON → stdout)
+  → Docker json-file driver
+    → Logstash  (tail, parse, drop foreign lines, retype)
+      → Elasticsearch  (orders-logs-YYYY.MM.DD, 7d ILM)
+        → Kibana (explore)  +  Grafana (correlate beside metrics)
+```
+
+Why tail files rather than use Docker's `gelf` driver: those drivers *replace*
+`json-file`, so `docker logs` returns nothing and every local habit built on
+`make logs-pretty` / `make traces` dies with it. The cost is that Logstash runs
+as root to read `/var/lib/docker/containers`. In production this is Filebeat as
+a DaemonSet with the same mount.
+
+Two UIs, deliberately:
+
+| | Use it for |
+|---|---|
+| **Kibana** (`make kibana`) | exploring. Four provisioned saved searches — errors and warnings, slow requests, database queries, background worker — and an "Orders — Logs" dashboard, all imported from `kibana/saved-objects.ndjson` |
+| **Grafana** (RED dashboard, Logs row) | correlating. A logs panel sharing the dashboard's time range, so the lines explaining a latency spike are already on screen for that exact window |
+
+Kibana's saved objects are provisioned from a file in git for the same reason
+the Grafana dashboards are: a view that exists only in Kibana's saved-object
+index cannot be reviewed or diffed and vanishes with the container.
+
+Things that matter more than they look:
+
+- **Apply the index template before the first document.** A mapping ES invents
+  by guessing cannot be changed without reindexing. `scripts/elk_init.sh` is
+  idempotent and runs from `make up`.
+- **`keyword`, not `text`, for everything except `message`.** ES maps strings as
+  `text` *plus* a `.keyword` subfield by default — double storage. A
+  `dynamic_template` turns that off; `message` keeps its subfield because "which
+  message is flooding my index?" is a question you actually ask. `stack` is
+  stored but not indexed: you read stack traces, you never search them.
+- **Prometheus watches the log pipeline, not Elasticsearch.** A store cannot
+  alert you that it stopped being written to. `OrdersLogShippingStopped` fires on
+  `orders-logs-*` document count flat *while the service is serving traffic* —
+  the `and` clause is what stops it crying wolf on an idle service overnight.
+- **`start_position => "end"`.** `beginning` backfills every byte of every
+  matched log file; measured here at 4.5M lines read to keep 1,020.
+- **Comments go in `_meta`, never in `properties`.** Elasticsearch parses every
+  key under `properties` as a field mapping, so a explanatory string there fails
+  the whole template with `Expected map for property [fields]` — and `curl -sf`
+  hides it unless you check the exit code.
+
+## Traces (Jaeger)
+
+```
+app (OTLP/HTTP) → Jaeger collector → Elasticsearch (jaeger-span-*)
+                                       ↓
+                            Jaeger UI  +  Grafana
+```
+
+Jaeger stores into the **same Elasticsearch as the logs**: one storage system,
+one thing to operate and back up. The cost is that trace indices compete with
+log indices for the same heap, which is why traces are kept for 3 days against
+the logs' 7 — spans are far bulkier per useful question answered.
+
+Switching from the stdout exporter was not only about getting a UI. Those
+pretty-printed spans were going to stderr, into the same Docker log files
+Logstash tails: **Logstash's read rate dropped from ~45,000 lines/s to 0/s.**
+Almost all of the log pipeline's load was the traces pillar shouting into it.
+
+### The three links between pillars
+
+| From | To | Mechanism |
+|---|---|---|
+| metrics → traces | exemplar diamond on any latency histogram | `exemplarTraceIdDestinations` → `datasourceUid: jaeger` |
+| logs → traces | `trace_id` is clickable on every log line | Elasticsearch datasource `dataLinks` |
+| traces → logs | a span opens the log lines written during it | `tracesToLogsV2`, ±1s window |
+| traces → metrics | a slow span opens that route's rate and p99 | `tracesToMetrics`, joined on `http.route` |
+
+All four join on values the application already emits. Nothing in the backends
+is doing correlation work — `tracing.Middleware` puts `trace_id` on the logging
+context, `routeLabel` gives metrics and traces the same route template, and
+`internal/metrics/exemplar.go` attaches the trace ID to histogram observations.
+
+### Retention
+
+Jaeger creates its own composable index templates, and composable templates do
+not merge — a second template matching `jaeger-span-*` would replace Jaeger's
+mappings rather than add a lifecycle policy to them. So retention is the
+official index cleaner (`make jaeger-clean`, run on a schedule), which is how
+Jaeger-on-Elasticsearch is actually operated. `ES_USE_ILM=true` is the
+alternative and additionally needs rollover aliases and an init job.
 
 ## Not built here
 
-- **Log aggregation.** The app writes JSON to stdout and stops there. Shipping to
-  a log store, indexing, and log dashboards are a separate layer.
-- **Traces**, the third pillar. `NewRequestID()` already produces a 128-bit hex
-  value — the same shape as a W3C trace-id — so it becomes the join key when
-  tracing lands, and the metrics layer already emits OpenMetrics with exemplar
-  support, which is the hook traces attach to.
+- **A deadman's switch for alert delivery.** `alertmanager_notifications_failed_total`
+  has no alert on it, and an alert about the delivery path is circular anyway —
+  that one needs an external watchdog.
+- **Tail-based sampling.** `TRACING_SAMPLE_RATIO` is head-based: the decision is
+  made at the root span, before anything is known about how the request turned
+  out. Keeping 100% of *errors and slow requests* and 1% of the rest needs a
+  collector that buffers whole traces — the OpenTelemetry Collector's
+  `tailsamplingprocessor` between the app and Jaeger.
+- **Span metrics.** Jaeger is configured with `METRICS_STORAGE_TYPE=prometheus`,
+  but the RED-metrics-from-spans view needs the collector's `spanmetrics`
+  connector to be generating them.

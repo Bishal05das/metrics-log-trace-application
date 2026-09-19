@@ -11,12 +11,16 @@ import (
 )
 
 type fakeBacklogStore struct {
-	counts map[domain.Status]int64
-	oldest time.Duration
-	err    error
+	counts       map[domain.Status]int64
+	oldest       time.Duration
+	err          error
+	panicOnCount bool
 }
 
 func (f *fakeBacklogStore) CountOrdersByStatus(context.Context) (map[domain.Status]int64, error) {
+	if f.panicOnCount {
+		panic("count query exploded")
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -36,6 +40,17 @@ type fakeBacklogMetrics struct {
 	oldest   time.Duration
 	sets     int
 	failures int
+	panics   map[string]int
+}
+
+func newFakeBacklogMetrics() *fakeBacklogMetrics {
+	return &fakeBacklogMetrics{panics: map[string]int{}}
+}
+
+func (f *fakeBacklogMetrics) panicCount(stage string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.panics[stage]
 }
 
 func (f *fakeBacklogMetrics) SetBacklog(counts map[string]int64, oldest time.Duration) {
@@ -50,12 +65,18 @@ func (f *fakeBacklogMetrics) BacklogRefreshFailed() {
 	f.failures++
 }
 
+func (f *fakeBacklogMetrics) WorkerPanic(stage string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.panics[stage]++
+}
+
 func TestRefreshPublishesCountsAndAge(t *testing.T) {
 	st := &fakeBacklogStore{
 		counts: map[domain.Status]int64{domain.StatusPending: 42, domain.StatusPaid: 7},
 		oldest: 90 * time.Second,
 	}
-	m := &fakeBacklogMetrics{}
+	m := newFakeBacklogMetrics()
 
 	NewBacklogRefresher(st, m, testLogger(), time.Minute).refresh(context.Background())
 
@@ -75,7 +96,7 @@ func TestRefreshPublishesCountsAndAge(t *testing.T) {
 // stale value plus a stale refresh timestamp.
 func TestRefreshFailureLeavesPreviousValues(t *testing.T) {
 	st := &fakeBacklogStore{counts: map[domain.Status]int64{domain.StatusPending: 500}}
-	m := &fakeBacklogMetrics{}
+	m := newFakeBacklogMetrics()
 	r := NewBacklogRefresher(st, m, testLogger(), time.Minute)
 
 	r.refresh(context.Background())
@@ -101,7 +122,7 @@ func TestRefreshFailureLeavesPreviousValues(t *testing.T) {
 // refresh means the gauges read "no data" on the first scrapes after a deploy.
 func TestRunRefreshesImmediately(t *testing.T) {
 	st := &fakeBacklogStore{counts: map[domain.Status]int64{domain.StatusPending: 1}}
-	m := &fakeBacklogMetrics{}
+	m := newFakeBacklogMetrics()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -121,5 +142,20 @@ func TestRunRefreshesImmediately(t *testing.T) {
 			t.Fatal("no refresh happened before the first tick")
 		case <-time.After(5 * time.Millisecond):
 		}
+	}
+}
+
+// A panic in the refresher would take down the process, and — worse — is
+// invisible in the gauges it maintains: they simply freeze at their last
+// values, which reads as a calm, stable backlog.
+func TestPanicInBacklogRefreshIsRecoveredAndCounted(t *testing.T) {
+	st := &fakeBacklogStore{panicOnCount: true}
+	m := newFakeBacklogMetrics()
+
+	// The assertion is that this returns rather than crashing the test binary.
+	NewBacklogRefresher(st, m, testLogger(), time.Minute).refresh(context.Background())
+
+	if got := m.panicCount(StageBacklog); got != 1 {
+		t.Errorf("panics{stage=backlog_refresh} = %d, want 1", got)
 	}
 }

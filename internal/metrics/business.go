@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"context"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -38,6 +39,7 @@ type Business struct {
 	processing *prometheus.HistogramVec // outcome
 
 	workerRuns     *prometheus.CounterVec // result
+	workerPanics   *prometheus.CounterVec // stage
 	workerBatch    prometheus.Histogram
 	workerDuration prometheus.Histogram
 
@@ -88,6 +90,10 @@ func NewBusiness(reg prometheus.Registerer, knownStatuses []string) *Business {
 			Name:      "processing_duration_seconds",
 			Help:      "Time to process one order, by outcome.",
 			Buckets:   ProcessingBuckets,
+
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
 		}, []string{"outcome"}),
 
 		workerRuns: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -97,12 +103,36 @@ func NewBusiness(reg prometheus.Registerer, knownStatuses []string) *Business {
 			Help:      "Worker loop iterations by result.",
 		}, []string{"result"}),
 
+		// The background counterpart to orders_http_panics_total.
+		//
+		// An HTTP panic is contained: the recovery middleware turns it into a
+		// 500 and the process lives on. A panic in a background goroutine has
+		// no such net — it unwinds past Run() and takes the whole process down,
+		// or (once recovery is added, as it now is) silently kills one batch.
+		//
+		// Neither is visible in any other metric. A dead worker produces no
+		// errors and no latency, it just stops, which is precisely the failure
+		// mode this package's doc comment warns about. Counting panics by stage
+		// separates "one order is poison" from "the claim query is broken".
+		workerPanics: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: "worker",
+			Name:      "panics_total",
+			Help:      "Panics recovered in background goroutines, by stage.",
+		}, []string{"stage"}),
+
 		workerBatch: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: Namespace,
 			Subsystem: "worker",
 			Name:      "batch_size",
 			Help:      "Orders claimed per iteration. Consistently hitting the max means you are falling behind.",
 			Buckets:   []float64{0, 1, 2, 5, 10, 20, 50, 100},
+
+			// Deliberately the ONE histogram here with no native buckets. This
+			// measures a small bounded integer capped at WORKER_BATCH_SIZE, so
+			// the eight explicit boundaries already describe every value it can
+			// take. Exponential buckets solve a wide-dynamic-range problem this
+			// metric does not have, and would only add cost.
 		}),
 
 		workerDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -111,6 +141,10 @@ func NewBusiness(reg prometheus.Registerer, knownStatuses []string) *Business {
 			Name:      "batch_duration_seconds",
 			Help:      "Wall time of one worker iteration.",
 			Buckets:   ProcessingBuckets,
+
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
 		}),
 
 		backlog: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -160,7 +194,7 @@ func NewBusiness(reg prometheus.Registerer, knownStatuses []string) *Business {
 
 	reg.MustRegister(
 		b.created, b.createdValue, b.transitions, b.processing,
-		b.workerRuns, b.workerBatch, b.workerDuration,
+		b.workerRuns, b.workerPanics, b.workerBatch, b.workerDuration,
 		b.backlog, b.backlogOldest, b.backlogRefresh, b.backlogErrors,
 	)
 	return b
@@ -186,7 +220,23 @@ func (b *Business) PreInit(currencies []string, transitions [][2]string) {
 	for _, r := range []string{"ok", "empty", "error"} {
 		b.workerRuns.WithLabelValues(r)
 	}
+
+	// Same reasoning as orders_http_panics_total: an alert of the form
+	// `increase(...panics_total[5m]) > 0` cannot match a series that does not
+	// exist, and a CounterVec with no children emits nothing at all — not even
+	// its HELP and TYPE lines. Without this the panic alert is silently dead
+	// until the first panic, which is the one moment it must already work.
+	for _, stage := range WorkerStages {
+		b.workerPanics.WithLabelValues(stage)
+	}
 }
+
+// WorkerStages are the recovery points in the background goroutines. Kept here
+// so the pre-initialised series and the call sites in internal/worker cannot
+// drift apart — a stage that panics but was never pre-initialised still gets
+// counted, it just appears in the exposition for the first time at the worst
+// possible moment.
+var WorkerStages = []string{"batch", "process_order", "backlog_refresh"}
 
 // OrderCreated satisfies httpapi.OrderEvents.
 func (b *Business) OrderCreated(currency string, amountCents int64) {
@@ -199,14 +249,27 @@ func (b *Business) Transition(from, to string) {
 	b.transitions.WithLabelValues(from, to).Inc()
 }
 
-func (b *Business) OrderProcessed(outcome string, d time.Duration) {
-	b.processing.WithLabelValues(outcome).Observe(d.Seconds())
+// OrderProcessed and WorkerRun take a context solely to carry the trace
+// exemplar.
+//
+// Background work is where exemplars pay for themselves most. A worker span is
+// a ROOT span in its own trace — there is no request to search by, no user
+// complaining, and no obvious way to find the trace for the one order that took
+// thirty seconds. The exemplar on this histogram is the only path from "the p99
+// is bad" to that specific trace.
+func (b *Business) OrderProcessed(ctx context.Context, outcome string, d time.Duration) {
+	observeExemplar(ctx, b.processing.WithLabelValues(outcome), d.Seconds())
 }
 
-func (b *Business) WorkerRun(result string, batchSize int, d time.Duration) {
+func (b *Business) WorkerRun(ctx context.Context, result string, batchSize int, d time.Duration) {
 	b.workerRuns.WithLabelValues(result).Inc()
 	b.workerBatch.Observe(float64(batchSize))
-	b.workerDuration.Observe(d.Seconds())
+	observeExemplar(ctx, b.workerDuration, d.Seconds())
+}
+
+// WorkerPanic records a recovered panic in a background goroutine.
+func (b *Business) WorkerPanic(stage string) {
+	b.workerPanics.WithLabelValues(stage).Inc()
 }
 
 // SetBacklog publishes the cached level metrics.

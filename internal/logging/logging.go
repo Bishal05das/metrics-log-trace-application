@@ -22,18 +22,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
-type Format string
+type Format string    // compile time type safety
 
 const (
-	FormatJSON Format = "json"
-	FormatText Format = "text"
+	FormatJSON Format = "json"  // compile time type safety
+	FormatText Format = "text"  // compile time type safety
 )
 
 type Config struct {
 	Level  string
-	Format Format
+	Format Format 
 
 	// Source adds file:line to every record. Genuinely useful and genuinely
 	// not free — it costs a runtime.Caller per record. Default it off in
@@ -46,6 +47,51 @@ type Config struct {
 	Service string
 	Version string
 	Env     string
+
+	// SampleN and SampleInterval cap repetitive DEBUG/INFO records: at most
+	// SampleN records per distinct MESSAGE per interval. WARN and above are
+	// never sampled.
+	//
+	// This is the cost control for the whole pillar, and it has to live in the
+	// application rather than the log shipper. By the time a line reaches Alloy
+	// you have already paid to format it, serialise it and write it to a pipe;
+	// dropping it there saves storage but not the work. Dropping it here saves
+	// both.
+	//
+	// The default (50/s) is deliberately above normal traffic — nothing is
+	// dropped during ordinary use — but hard-caps a runaway loop. Set SampleN
+	// to 0 to disable.
+	SampleN        int
+	SampleInterval time.Duration
+
+	// Recorder counts log volume as METRICS. Optional; nil disables counting.
+	//
+	// Why this matters enough to thread an interface through: `sampled_dropped`
+	// is an attribute inside a log DOCUMENT, so the only way to ask "how much
+	// are we dropping?" was to query Elasticsearch — which means the answer
+	// lives in the system that is downstream of the thing being measured. If
+	// shipping breaks, the number describing your log volume disappears along
+	// with the logs.
+	//
+	// A counter in Prometheus is upstream of all of it, costs two atomic
+	// increments, and makes log volume alertable the same way every other rate
+	// in this project is.
+	Recorder Recorder
+}
+
+// Recorder observes log record volume. Implemented by metrics.Logs.
+//
+// Declared HERE, on the consumer side, so this package never imports
+// internal/metrics — the same pattern as metrics.PoolStats, worker.Store and
+// httpapi.OrderEvents. logging is the lowest-level package in the project and
+// must stay that way; a dependency on the metrics registry would make it
+// untestable and would invert the layering.
+type Recorder interface {
+	// LogRecord is called once for every record that passes the level filter,
+	// before sampling decides its fate.
+	LogRecord(level string)
+	// LogRecordDropped is called when the sampler discards a record.
+	LogRecordDropped(level string)
 }
 
 // New builds the application logger.
@@ -74,19 +120,46 @@ func New(cfg Config) (*slog.Logger, *slog.LevelVar) {
 		AddSource:   cfg.Source, //from where log was generated
 		ReplaceAttr: replaceAttr,
 	}
-    // we want log as json format
+	// JSON is the default because a log SHIPPER has to parse these lines.
+	// Logstash's `json` filter reads them with no pattern to maintain; a text
+	// format would need grok, and a grok pattern silently stops matching the day
+	// someone adds a field. Text exists for reading in a terminal during local
+	// development, nothing else.
 	var base slog.Handler
 	switch cfg.Format {
 	case FormatText:
 		base = slog.NewTextHandler(os.Stdout, opts)
-	default:
+	case FormatJSON, "":
 		base = slog.NewJSONHandler(os.Stdout, opts)
+	default:
+		// An unrecognised value is a config typo. Fall back to JSON rather than
+		// failing to start, but say so — silently ignoring it would leave you
+		// wondering why LOG_FORMAT=jsonn changed nothing.
+		base = slog.NewJSONHandler(os.Stdout, opts)
+		defer slog.New(base).Warn("unknown log format, defaulting to json",
+			"got", string(cfg.Format), "want", []string{string(FormatJSON), string(FormatText)})
 	}
+	//json handler can not handler the context of logs thats why we need custom handler.
 
-	// ContextHandler wraps the base so that request-scoped attributes stored
-	// in the context are attached to EVERY record automatically. See handler.go
-	// — it is the piece that makes correlation work without touching call sites.
+	// The handler chain, from the record's point of view:
+	//
+	//	record → SamplingHandler → ContextHandler → JSON/Text → stdout
+	//
+	// SamplingHandler is OUTERMOST on purpose. It decides to drop using only
+	// r.Message, so putting it first means a dropped record never pays for
+	// context enrichment or JSON encoding. Reversing the two would do all that
+	// work and then throw the result away — which is most of the cost the
+	// sampler exists to avoid.
 	h := slog.Handler(&ContextHandler{Handler: base})
+	if cfg.SampleN > 0 {
+		h = NewSamplingHandler(h, cfg.SampleN, cfg.SampleInterval, cfg.Recorder)
+	}
+	// countingHandler goes OUTSIDE the sampler, so it counts what was
+	// ATTEMPTED. Inside, it would count only survivors and the drop ratio would
+	// be uncomputable — which is the one number you want when the bill jumps.
+	if cfg.Recorder != nil {
+		h = &countingHandler{Handler: h, rec: cfg.Recorder}
+	}
 
 	logger := slog.New(h)
 
@@ -98,6 +171,7 @@ func New(cfg Config) (*slog.Logger, *slog.LevelVar) {
 	), levelVar
 }
 
+// string -> slog.level
 func parseLevel(s string) slog.Level {
 	var l slog.Level
 	if err := l.UnmarshalText([]byte(strings.ToLower(s))); err != nil {

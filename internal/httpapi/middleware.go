@@ -57,7 +57,7 @@ func Recover(log *slog.Logger, onPanic func(*http.Request)) Middleware {
 
 				// Best-effort: if the handler already wrote a header this is a
 				// no-op, which is fine.
-				writeError(w, http.StatusInternalServerError, codeInternal, "internal error", "")
+				writeError(r.Context(), w, http.StatusInternalServerError, codeInternal, "internal error", "")
 			}()
 
 			next.ServeHTTP(w, r)

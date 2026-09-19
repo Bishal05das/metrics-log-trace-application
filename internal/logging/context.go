@@ -63,22 +63,15 @@ const (
 	RequestIDHeader = "X-Request-Id"
 )
 
-type requestIDKey struct{}
-
-// WithRequestID stores the id both as a log attribute and as a directly
-// retrievable value.
+// WithRequestID stores the id as a log attribute, so ContextHandler attaches it
+// to every subsequent record made with this context.
+//
+// An earlier version also stashed it under a private context key, for a
+// RequestID(ctx) getter that nothing ever called — an allocation on every
+// request for a value that was never read back. If you find you need the raw
+// string again, take it from Attrs(ctx) rather than storing it twice.
 func WithRequestID(ctx context.Context, id string) context.Context {
-	ctx = context.WithValue(ctx, requestIDKey{}, id)
 	return WithAttrs(ctx, slog.String(RequestIDKey, id))
-}
-
-// RequestID returns the request ID, or "" if there is none.
-func RequestID(ctx context.Context) string {
-	if ctx == nil {
-		return ""
-	}
-	id, _ := ctx.Value(requestIDKey{}).(string)
-	return id
 }
 
 // NewRequestID returns a 128-bit random hex identifier.

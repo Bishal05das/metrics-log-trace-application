@@ -1,0 +1,21 @@
+{
+  "policy": {
+    "_meta": {
+      "description": "Retention for orders-logs-*. Matched to Prometheus's --storage.tsdb.retention.time=7d so the two pillars cover the same window; a log store that outlives its metrics leaves you able to read lines you can no longer put in context."
+    },
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "delete": {
+        "min_age": "7d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}

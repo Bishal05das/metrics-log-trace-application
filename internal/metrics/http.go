@@ -124,6 +124,15 @@ func NewHTTP(reg prometheus.Registerer) *HTTP {
 				Name:      "response_size_bytes",
 				Help:      "HTTP response body size in bytes.",
 				Buckets:   ResponseSizeBuckets,
+
+				// Sizes span four orders of magnitude here (64B to 1MiB) across
+				// only eight classic buckets, so the classic representation is
+				// coarse by construction. Native buckets cost nothing extra to
+				// emit and make "responses grew 3x" visible instead of "more
+				// things are in the 16KiB-64KiB bucket now".
+				NativeHistogramBucketFactor:     1.1,
+				NativeHistogramMaxBucketNumber:  100,
+				NativeHistogramMinResetDuration: time.Hour,
 			},
 			[]string{"route", "method"},
 		),
@@ -238,15 +247,21 @@ func (h *HTTP) Middleware(next http.Handler) http.Handler {
 		class := statusClass(rec.status)
 		code := strconv.Itoa(rec.status)
 
+		// The trace span was started by tracing.Middleware, which sits OUTSIDE
+		// this one, so r.Context() already carries it and the span is still
+		// open — it does not end until that outer middleware returns. Reading
+		// the trace ID here is what links this histogram to a real request.
+		ctx := r.Context()
+
 		h.requests.WithLabelValues(route, r.Method, code, class).Inc()
-		h.duration.WithLabelValues(route, r.Method, class).Observe(elapsed)
-		h.respSize.WithLabelValues(route, r.Method).Observe(float64(rec.written))
+		observeExemplar(ctx, h.duration.WithLabelValues(route, r.Method, class), elapsed)
+		observeExemplar(ctx, h.respSize.WithLabelValues(route, r.Method), float64(rec.written))
 	})
 }
 
 // RecordPanic is called by the recovery middleware.
 func (h *HTTP) RecordPanic(r *http.Request) {
-	h.panics.WithLabelValues(routeLabel(r)).Inc()
+	addExemplar(r.Context(), h.panics.WithLabelValues(routeLabel(r)), 1)
 }
 
 // routeLabel converts a request into a bounded label value.
@@ -334,8 +349,4 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// Unwrap lets http.NewResponseController reach the real ResponseWriter, so
-// Flush, Hijack and deadline control keep working through this wrapper. Before
-// Go 1.20 you had to hand-implement every optional interface, and forgetting
-// one silently broke SSE and WebSocket upgrades — a classic middleware bug.
 func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }

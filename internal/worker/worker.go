@@ -13,8 +13,10 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand"
+	"runtime/debug"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,10 +40,17 @@ type Store interface {
 
 // Metrics is what the worker reports. Also an interface, so tests can assert
 // on calls rather than scraping a registry.
+//
+// The context arguments exist only so the metrics implementation can read the
+// active span and attach a trace exemplar. This package neither knows nor cares
+// whether it does — a fake in a test ignores the argument entirely.
 type Metrics interface {
 	Transition(from, to string)
-	OrderProcessed(outcome string, d time.Duration)
-	WorkerRun(result string, batchSize int, d time.Duration)
+	OrderProcessed(ctx context.Context, outcome string, d time.Duration)
+	WorkerRun(ctx context.Context, result string, batchSize int, d time.Duration)
+
+	// WorkerPanic counts a recovered panic, by stage. See guard().
+	WorkerPanic(stage string)
 }
 
 // Processor decides an order's fate. Injectable so tests are deterministic —
@@ -104,6 +113,53 @@ func (w *Worker) WithProcessor(p Processor) *Worker {
 	return w
 }
 
+// Stage names for guard(). They are the label values on
+// orders_worker_panics_total and must match metrics.WorkerStages, which
+// pre-initialises those series.
+const (
+	stageBatch        = "batch"
+	stageProcessOrder = "process_order"
+	StageBacklog      = "backlog_refresh"
+)
+
+// guard turns a panic in a background goroutine into a counted, logged incident
+// instead of a dead process.
+//
+// This matters more here than in an HTTP handler, and the asymmetry is the
+// point. A panic in a handler is already contained: httpapi.Recover turns it
+// into a 500, the client sees an error, and orders_http_panics_total moves. A
+// panic in a goroutine has NO such net — it unwinds past Run() and terminates
+// the entire process, taking the API down with it. One malformed order could
+// stop the whole service.
+//
+// Recovering alone is not enough, because a silently swallowed panic is its own
+// outage: the worker appears to run while doing nothing. So every recovery is
+// counted (alertable), logged with a stack (debuggable), and marked on the span
+// (traceable) — the same event visible in all three pillars.
+//
+// Deliberately NOT handled here: an order that panics mid-processing stays in
+// `processing` until something releases it. Doing that from a panic path means
+// running more code in an already-unknown state, so the honest answer is to let
+// OrdersBacklogAgeHigh catch the stranded row.
+func (w *Worker) guard(ctx context.Context, stage string) {
+	r := recover()
+	if r == nil {
+		return
+	}
+
+	w.metrics.WorkerPanic(stage)
+
+	// Deferred calls run LIFO, so this executes while the span from the calling
+	// function is still open — span.End() was deferred first.
+	span := trace.SpanFromContext(ctx)
+	err := fmt.Errorf("panic: %v", r)
+	span.RecordError(err)
+	span.SetStatus(codes.Error, "panic")
+
+	w.log.ErrorContext(ctx, "recovered panic in background worker",
+		"stage", stage, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+}
+
 // Run loops until ctx is cancelled. It returns only after the in-flight batch
 // finishes, so a shutdown never leaves orders stranded in `processing`.
 func (w *Worker) Run(ctx context.Context) {
@@ -134,6 +190,7 @@ func (w *Worker) runOnce(ctx context.Context) {
 
 	ctx, span := w.cfg.Tracer.Start(ctx, "worker.batch", trace.WithSpanKind(trace.SpanKindConsumer))
 	defer span.End()
+	defer w.guard(ctx, stageBatch)
 
 	orders, err := w.store.ClaimPendingOrders(ctx, w.cfg.BatchSize)
 	if err != nil {
@@ -143,7 +200,7 @@ func (w *Worker) runOnce(ctx context.Context) {
 		w.log.ErrorContext(ctx, "claim pending orders failed", "error", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "claim failed")
-		w.metrics.WorkerRun("error", 0, time.Since(start))
+		w.metrics.WorkerRun(ctx, "error", 0, time.Since(start))
 		return
 	}
 
@@ -153,7 +210,7 @@ func (w *Worker) runOnce(ctx context.Context) {
 		// keeping up" apart from "the worker has stopped receiving work",
 		// which look identical if you only count successes.
 		span.SetAttributes(attribute.Int("batch.size", 0))
-		w.metrics.WorkerRun("empty", 0, time.Since(start))
+		w.metrics.WorkerRun(ctx, "empty", 0, time.Since(start))
 		return
 	}
 
@@ -169,7 +226,7 @@ func (w *Worker) runOnce(ctx context.Context) {
 		w.processOne(ctx, o)
 	}
 
-	w.metrics.WorkerRun("ok", len(orders), time.Since(start))
+	w.metrics.WorkerRun(ctx, "ok", len(orders), time.Since(start))
 }
 
 func (w *Worker) processOne(ctx context.Context, o domain.Order) {
@@ -178,6 +235,12 @@ func (w *Worker) processOne(ctx context.Context, o domain.Order) {
 	ctx, span := w.cfg.Tracer.Start(ctx, "worker.process_order",
 		trace.WithAttributes(attribute.String("order.id", o.ID.String())))
 	defer span.End()
+
+	// Recovering per ORDER, not just per batch, is deliberate: one poison order
+	// should cost you that order, not the other nineteen in the batch. The
+	// batch-level guard above remains as a backstop for the claim query and the
+	// loop itself.
+	defer w.guard(ctx, stageProcessOrder)
 
 	// The detached write context is built FIRST, because every exit path below
 	// needs it — including the cancellation path.
@@ -201,12 +264,18 @@ func (w *Worker) processOne(ctx context.Context, o domain.Order) {
 		// Marking it `failed` would be a lie — it would claim a payment failed
 		// that was never attempted, and it is a terminal state, so the order
 		// would never be retried. Releasing is the honest, recoverable choice.
+		// ErrorContext/InfoContext, not Error/Info. ctx is cancelled by now, but
+		// it still CARRIES the worker.process_order span, and ContextHandler
+		// reads attributes off it regardless of cancellation. Using the plain
+		// variants here meant the shutdown-safety path — the one whose bug cost
+		// the most to find — was the only path whose logs could not be joined to
+		// its trace.
 		if relErr := w.store.MarkOrder(writeCtx, o.ID, domain.StatusPending); relErr != nil {
-			w.log.Error("releasing interrupted order failed",
+			w.log.ErrorContext(ctx, "releasing interrupted order failed",
 				"order_id", o.ID, "error", relErr)
 			return
 		}
-		w.log.Info("released interrupted order back to pending", "order_id", o.ID)
+		w.log.InfoContext(ctx, "released interrupted order back to pending", "order_id", o.ID)
 		span.SetStatus(codes.Error, "interrupted; released to pending")
 		w.metrics.Transition(string(domain.StatusProcessing), string(domain.StatusPending))
 		return
@@ -233,7 +302,7 @@ func (w *Worker) processOne(ctx context.Context, o domain.Order) {
 		span.SetStatus(codes.Error, "payment failed")
 	}
 	w.metrics.Transition(string(domain.StatusProcessing), string(outcome))
-	w.metrics.OrderProcessed(string(outcome), time.Since(start))
+	w.metrics.OrderProcessed(ctx, string(outcome), time.Since(start))
 }
 
 // simulatePayment stands in for a real payment gateway call.

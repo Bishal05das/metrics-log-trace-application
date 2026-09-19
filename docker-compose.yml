@@ -45,6 +45,19 @@ services:
       DATABASE_URL: postgres://orders:orders@postgres:5432/orders?sslmode=disable
       LOG_LEVEL: info
       WORKER_ENABLED: "true"
+      # Spans now go to Jaeger over OTLP/HTTP instead of being pretty-printed to
+      # stderr. That is not only about having a UI: the stdout exporter was
+      # writing millions of lines of span JSON into the same Docker log files
+      # Logstash tails, which is most of the ~6M lines it was reading to keep
+      # ~7k. Switching exporters removes that load entirely.
+      #
+      # No scheme, no path — otlptracehttp wants host:port and appends
+      # /v1/traces itself. The CONTAINER port is 4318 regardless of the shifted
+      # host mapping.
+      OTEL_EXPORTER: otlp
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4318
+      OTEL_EXPORTER_OTLP_INSECURE: "true"
+      TRACING_SAMPLE_RATIO: "1.0"
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,32 +67,34 @@ services:
     image: prom/prometheus:v3.1.0
     container_name: mlt-prometheus
     ports:
-      - "9095:9090"
+      - "9095:9090" #host port: container port
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro #host:container ro->read only
       - ./prometheus/rules:/etc/prometheus/rules:ro
-      # Watched live by file_sd — edit the JSON and Prometheus picks it up
-      # within refresh_interval, with no restart.
+
       - ./prometheus/targets:/etc/prometheus/targets:ro
-      - promdata:/prometheus
-    # On Linux, host.docker.internal is not resolvable by default. host-gateway
-    # maps it to the Docker bridge gateway, which is how a container reaches a
-    # service listening on the host — in our case the Go app on :9100.
+      - promdata:/prometheus  # promdata is a docker volume and mount it inside container at /prometheus folder
+    
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - "host.docker.internal:host-gateway"  # host er localhost != container localhoost for accessig container to host it is used
     command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      # How long raw samples are kept. Prometheus is a short-horizon store by
-      # design; anything longer belongs in a remote-write backend.
-      - "--storage.tsdb.retention.time=7d"
-      # Required to ingest native histograms; without it the protobuf scrape
-      # still works but the exponential buckets are discarded.
-      - "--enable-feature=native-histograms"
-      # Lets `make prom-reload` apply config changes without a restart, which
-      # matters in production: restarting Prometheus loses in-memory state and
-      # creates a gap in every series it stores.
-      - "--web.enable-lifecycle"
+      - "--config.file=/etc/prometheus/prometheus.yml" # setting config file
+      - "--storage.tsdb.path=/prometheus" #setting storage file
+      
+      - "--storage.tsdb.retention.time=7d" # keeps data for 7 days
+      
+      - "--enable-feature=native-histograms" #histogram type = native
+
+      # Without this Prometheus PARSES exemplars off the wire and then throws
+      # them away — no error, no warning, they simply never appear in a query.
+      # Storage is a fixed-size circular buffer (default 100k), so the cost is
+      # bounded and does not grow with cardinality. This is the third of the
+      # three things that must all be true for exemplars to work; the other two
+      # are EnableOpenMetrics in internal/metrics/server.go and the
+      # ObserveWithExemplar calls in internal/metrics/exemplar.go.
+      - "--enable-feature=exemplar-storage"
+
+      - "--web.enable-lifecycle" #reload configuration without restart.. config edit kore POST /-/reload call korlei auto reload hobe
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
       interval: 5s
@@ -137,8 +152,171 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # ELK — the logs pillar's backend.
+  #
+  # The split of responsibilities mirrors the metrics side, with one important
+  # difference in how they INDEX:
+  #
+  #   Prometheus  indexes labels; the sample itself is a number. Cardinality is
+  #               the enemy, because every label combination is a new series.
+  #   Elasticsearch indexes FIELDS of every document. High cardinality is fine —
+  #               that is the whole point of a log store — but the field TYPE
+  #               decides the cost. See elasticsearch/index-template.json.
+  #
+  # Resource note: this is a JVM stack and it is not free. Heaps are capped
+  # deliberately low (512m ES, 256m Logstash) so the whole project still fits
+  # comfortably in a few GB. Production would give Elasticsearch far more.
+  # ---------------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    container_name: mlt-elasticsearch
+    environment:
+      # single-node ALSO puts Elasticsearch into development mode, which skips
+      # the bootstrap checks — including the vm.max_map_count >= 262144 check
+      # that would otherwise refuse to start on a host you cannot sysctl.
+      discovery.type: single-node
+      cluster.name: mlt-logs
+      # Local only. With security on, 8.x generates certificates and a password
+      # on first boot and every curl in this project would need them.
+      xpack.security.enabled: "false"
+      xpack.security.enrollment.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      bootstrap.memory_lock: "false"
+    ports:
+      - "9201:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      # yellow, not green: a single node cannot allocate replicas, so a
+      # one-node cluster is yellow by design and waiting for green hangs forever.
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.17.0
+    container_name: mlt-logstash
+    # Required to read /var/lib/docker/containers, which is root:root 0710.
+    # See the header of logstash/pipeline/orders.conf for why we tail files
+    # instead of using Docker's gelf driver.
+    user: root
+    environment:
+      LS_JAVA_OPTS: "-Xms256m -Xmx256m"
+    volumes:
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      # Persists sincedb, so a restart resumes instead of re-ingesting every
+      # log file from the beginning and duplicating every document.
+      - lsdata:/usr/share/logstash/data
+    ports:
+      - "9601:9600"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9600/_node/stats > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  # Elasticsearch has no /metrics endpoint of its own, so Prometheus cannot see
+  # it without this translator. That matters more than it sounds: without it the
+  # logs pillar is the one part of the system with NO alerting on itself, and a
+  # log pipeline that quietly stops is precisely the failure mode that leaves
+  # you blind during the next incident — every dashboard green, no lines.
+  #
+  # Scraping the DOCUMENT COUNT is the end-to-end signal. A healthy Logstash
+  # proves one hop; documents arriving in Elasticsearch proves the whole chain.
+  elasticsearch-exporter:
+    image: quay.io/prometheuscommunity/elasticsearch-exporter:v1.7.0
+    container_name: mlt-es-exporter
+    command:
+      - "--es.uri=http://elasticsearch:9200"
+      # Per-index stats, which is what carries the orders-logs-* doc count.
+      - "--es.indices"
+      - "--es.indices_settings"
+    ports:
+      - "9114:9114"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Jaeger — the traces pillar's backend, storing into the Elasticsearch that
+  # already holds the logs.
+  #
+  # One storage system for two pillars is the reason to do it this way: the same
+  # retention policy, the same disk, the same thing to operate and back up. The
+  # cost is that trace indices compete with log indices for the same heap, which
+  # is why the ILM policy applied by scripts/elk_init.sh keeps traces to 3 days
+  # against the logs' 7 — spans are far bulkier per useful question answered.
+  #
+  # Ports are shifted off Jaeger's defaults (16686/4317/4318) because another
+  # stack on this machine already holds them. The APP does not care: it reaches
+  # the collector as `jaeger:4318` on the compose network, where the container
+  # port is unchanged.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: mlt-jaeger
+    environment:
+      SPAN_STORAGE_TYPE: elasticsearch
+      ES_SERVER_URLS: http://elasticsearch:9200
+      # Jaeger must be told the major version; it picks different index APIs for
+      # 7 vs 8 and guesses wrong against a security-disabled 8.x cluster.
+      ES_VERSION: "8"
+      # A single-node cluster cannot allocate replicas. Jaeger's default of
+      # 5 shards / 1 replica would leave every trace index YELLOW forever and
+      # make the cluster-health alert meaningless.
+      ES_NUM_SHARDS: "1"
+      ES_NUM_REPLICAS: "0"
+      # OTLP is off by default in 1.x. The application speaks OTLP/HTTP
+      # (otlptracehttp), so :4318 is the port that matters.
+      COLLECTOR_OTLP_ENABLED: "true"
+      METRICS_STORAGE_TYPE: prometheus
+      PROMETHEUS_SERVER_URL: http://prometheus:9090
+    ports:
+      - "16687:16686"   # UI
+      - "4319:4318"     # OTLP/HTTP  — what the app uses
+      - "4320:4317"     # OTLP/gRPC  — for anything that prefers gRPC
+      - "14269:14269"   # admin + /metrics, scraped by Prometheus
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:14269/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.17.0
+    container_name: mlt-kibana
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      SERVER_PUBLICBASEURL: http://localhost:5602
+      # Silences a startup warning; any 32+ char string works locally.
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: "mlt_local_dev_encryption_key_32ch"
+    ports:
+      - "5602:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:
   promdata:
   amdata:
   grafanadata:
+  esdata:
+  lsdata:

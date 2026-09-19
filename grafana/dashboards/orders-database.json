@@ -127,7 +127,7 @@
     {
       "type": "timeseries",
       "title": "Connection acquire wait (p99)",
-      "description": "On a healthy pool this is microseconds — you are taking an idle connection off a channel. Anything above ~1ms means you waited for someone else to finish.",
+      "description": "On a healthy pool this is microseconds — you are taking an idle connection off a channel. Anything above ~1ms means you waited for someone else to finish.\n\nWatch the third series during saturation. The overall mean is diluted by the fast path (most acquires never wait at all), so it stays flat while the requests that DO wait are waiting a second. That series averages only the acquisitions that found the pool empty.",
       "gridPos": { "h": 9, "w": 12, "x": 0, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
@@ -136,6 +136,11 @@
           "refId": "B",
           "expr": "rate(orders_db_pool_acquire_seconds_total[5m]) / clamp_min(rate(orders_db_pool_acquires_total[5m]), 1e-9)",
           "legendFormat": "mean acquire wait"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(orders_db_pool_empty_acquire_wait_seconds_total[5m]) / clamp_min(rate(orders_db_pool_empty_acquires_total[5m]), 1e-9)",
+          "legendFormat": "mean wait WHEN the pool was empty"
         }
       ],
       "fieldConfig": {
@@ -161,14 +166,20 @@
     {
       "type": "timeseries",
       "title": "Query execution time by named query",
-      "description": "Compare against acquire wait on the left. During the Phase 3 saturation experiment these lines stayed FLAT while acquire wait rose 100,000x.",
+      "description": "Compare against acquire wait on the left. During the Phase 3 saturation experiment these lines stayed FLAT while acquire wait rose 100,000x.\n\nThe p99 series carries exemplars: each diamond is one real query, linking to its trace. Recording rules cannot carry them, which is why that series queries the raw _bucket metric directly.",
       "gridPos": { "h": 9, "w": 12, "x": 12, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "refId": "A",
           "expr": "job_query:orders_db_query_duration_seconds:mean5m{status=\"ok\"} > 0",
-          "legendFormat": "{{query}}"
+          "legendFormat": "{{query}} mean"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (query, le) (rate(orders_db_query_duration_seconds_bucket{status=\"ok\"}[5m])))",
+          "legendFormat": "{{query}} p99",
+          "exemplar": true
         }
       ],
       "fieldConfig": {

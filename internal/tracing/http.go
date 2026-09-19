@@ -33,21 +33,15 @@ import (
 func Middleware(tracer trace.Tracer, log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Health probes fire every few seconds forever. Tracing them is
-			// pure cost — the same exclusion as metrics and logs.
+			// skip helath check
 			if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			// 1. EXTRACT the upstream context from the request headers.
 			ctx := otel.GetTextMapPropagator().Extract(
 				r.Context(), propagation.HeaderCarrier(r.Header))
 
-			// 2. START the span. The name is provisional: r.Pattern is not
-			// populated until ServeMux matches, which happens inside
-			// next.ServeHTTP — the same constraint the metrics middleware has.
-			// It is corrected below, once the route is known.
 			ctx, span := tracer.Start(ctx, r.Method,
 				trace.WithSpanKind(trace.SpanKindServer),
 				trace.WithAttributes(
@@ -60,10 +54,7 @@ func Middleware(tracer trace.Tracer, log *slog.Logger) func(http.Handler) http.H
 			)
 			defer span.End()
 
-			// 3. JOIN to the logs. Only when the span is actually recording —
-			// an unsampled span has a valid ID but no data behind it, and
-			// logging a trace_id that leads nowhere wastes an investigation.
-			sc := span.SpanContext()
+			sc := span.SpanContext() //get trace id and span id
 			if sc.IsValid() {
 				ctx = logging.WithAttrs(ctx,
 					slog.String("trace_id", sc.TraceID().String()),
@@ -71,30 +62,24 @@ func Middleware(tracer trace.Tracer, log *slog.Logger) func(http.Handler) http.H
 				)
 				// Return it to the client too, so a support ticket can carry
 				// the trace ID as well as the request ID.
-				w.Header().Set("X-Trace-Id", sc.TraceID().String())
+				w.Header().Set("X-Trace-Id", sc.TraceID().String()) //send trace id to client
 			}
 
 			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 			inner := r.WithContext(ctx)
 			next.ServeHTTP(rec, inner)
-			// Propagate the routing result back to the CALLER's request.
-			//
-			// r.WithContext returns a COPY. ServeMux sets Pattern on the copy it is
-			// handed, so any middleware ABOVE this one is left holding a request whose
-			// Pattern is still empty — and every route label derived from it becomes
-			// "unmatched". This silently broke the metrics route label the moment the
-			// request-ID middleware was introduced: 1333 real requests all labelled
-			// unmatched, with the per-route series pinned at zero.
-			//
-			// Copying the field back restores the invariant ServeMux established. Safe:
-			// it runs after next.ServeHTTP returns, on one goroutine, and ServeMux
-			// mutates this same field in place.
-			r.Pattern = inner.Pattern
+			
+			r.Pattern = inner.Pattern  //Incoming:GET /orders/12345.But the route is:GET /orders/{id} You want:http.route=/orders/{id}
 
-			// Now that ServeMux has matched, rename the span to the route
-			// TEMPLATE. Span names are a low-cardinality dimension in every
-			// tracing backend — naming spans after raw paths is the same
-			// cardinality mistake as a URL-valued metric label, one system over.
+			// Before:
+
+			// Span name:
+			// GET
+
+			// After:
+
+			// Span name:
+			// GET /orders/{id}
 			route := routeTemplate(r)
 			span.SetName(r.Method + " " + route)
 			span.SetAttributes(
@@ -102,10 +87,6 @@ func Middleware(tracer trace.Tracer, log *slog.Logger) func(http.Handler) http.H
 				semconv.HTTPResponseStatusCode(rec.status),
 			)
 
-			// Only 5xx marks the span as failed. A 404 is a correct answer to
-			// a wrong question; marking it an error makes every backend's
-			// error-rate view meaningless — the same reasoning as the log
-			// severity mapping.
 			if rec.status >= 500 {
 				span.SetStatus(codes.Error, http.StatusText(rec.status))
 			} else {

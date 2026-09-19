@@ -23,3 +23,33 @@ datasources:
       httpMethod: POST
       prometheusType: Prometheus
       prometheusVersion: 3.1.0
+
+      # Exemplars: the metrics → traces link.
+      #
+      # With this set, any histogram panel gets an "Exemplars" toggle, and the
+      # diamond markers it draws are clickable — each one carries the trace_id
+      # of one real request that landed in that bucket.
+      #
+      # `name` must match the exemplar label the application emits; see
+      # exemplarTraceIDLabel in internal/metrics/exemplar.go.
+      #
+      # `url` opens an external link, which works TODAY with no trace backend —
+      # the placeholder below just echoes the ID back. Once Tempo or Jaeger is
+      # running, replace the whole `url` line with:
+      #
+      #     datasourceUid: tempo
+      #
+      # and the click navigates straight into the trace view instead.
+      # METRICS → TRACES, the link this whole exemplar machinery exists for.
+      #
+      # `datasourceUid` rather than `url`: clicking an exemplar diamond now opens
+      # the trace INSIDE Grafana, next to the histogram that led you there,
+      # instead of navigating away to an external page. Until Jaeger existed this
+      # was a placeholder URL — the hook was built and pointed at nothing.
+      #
+      # `name` must match the exemplar label the application emits; see
+      # exemplarTraceIDLabel in internal/metrics/exemplar.go.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: jaeger
+          urlDisplayLabel: "View trace"

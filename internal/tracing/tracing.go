@@ -100,34 +100,25 @@ type Provider struct {
 // looks them up there, and refusing to set them means those spans are silently
 // dropped. The Tracer is still passed explicitly to our own code.
 func Init(ctx context.Context, cfg Config, log *slog.Logger) (*Provider, error) {
-	// Always install the W3C propagator, even when disabled. A service that
-	// does not RECORD traces should still PASS THROUGH the trace context it
-	// receives, or it becomes a hole in someone else's trace.
+	
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{}, // W3C `traceparent` / `tracestate`
 		propagation.Baggage{},      // W3C `baggage`
 	))
 
 	if !cfg.Enabled || cfg.Exporter == ExporterNone {
-		otel.SetTracerProvider(noop.NewTracerProvider())
+		otel.SetTracerProvider(noop.NewTracerProvider()) //A noop tracer is a fake tracer.
 		log.Info("tracing disabled", "propagation", "enabled (pass-through)")
 		return &Provider{Tracer: noop.NewTracerProvider().Tracer(cfg.ServiceName), log: log}, nil
 	}
 
-	exp, err := newExporter(ctx, cfg)
+	exp, err := newExporter(ctx, cfg) //where should spans go
 	if err != nil {
 		return nil, err
 	}
 
-	// The resource describes WHO is emitting these spans. It is attached to
-	// every span and is what lets a backend group a waterfall by service.
-	//
-	// resource.Merge REFUSES to combine resources with different schema URLs,
-	// and resource.Default() carries the SDK's own semconv version. Import a
-	// different semconv package here and Init fails at STARTUP with
-	// "conflicting Schema URL" — which is what v1.26.0 did against an SDK on
-	// v1.43.0. Keep this import pinned to the SDK's version.
-	res, err := resource.Merge(
+	
+	res, err := resource.Merge( //Attach information about your application/service to every trace and span.
 		resource.Default(),
 		resource.NewWithAttributes(
 			semconv.SchemaURL,
@@ -141,9 +132,7 @@ func Init(ctx context.Context, cfg Config, log *slog.Logger) (*Provider, error) 
 	}
 
 	tp := sdktrace.NewTracerProvider(
-		// Batching, not one export per span. Exporting synchronously would put
-		// a network call on the request path — the observability layer must
-		// never be able to slow down or fail the thing it observes.
+	
 		sdktrace.WithBatcher(exp,
 			sdktrace.WithMaxQueueSize(2048),
 			sdktrace.WithMaxExportBatchSize(512),
@@ -155,9 +144,6 @@ func Init(ctx context.Context, cfg Config, log *slog.Logger) (*Provider, error) 
 
 	otel.SetTracerProvider(tp)
 
-	// Errors from the SDK itself — a failing exporter, a dropped batch — go
-	// here. Without this they are discarded and your traces stop arriving with
-	// no indication why.
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
 		log.Error("otel error", "error", err)
 	}))
@@ -192,10 +178,10 @@ func newExporter(ctx context.Context, cfg Config) (sdktrace.SpanExporter, error)
 	switch cfg.Exporter {
 	case ExporterOTLP:
 		opts := []otlptracehttp.Option{}
-		if cfg.OTLPEndpoint != "" {
+		if cfg.OTLPEndpoint != "" { //Did the user provide an OTLP server address?
 			opts = append(opts, otlptracehttp.WithEndpoint(cfg.OTLPEndpoint))
 		}
-		if cfg.OTLPInsecure {
+		if cfg.OTLPInsecure { //Should we use HTTPS or HTTP?
 			opts = append(opts, otlptracehttp.WithInsecure())
 		}
 		exp, err := otlptracehttp.New(ctx, opts...)
@@ -205,13 +191,6 @@ func newExporter(ctx context.Context, cfg Config) (sdktrace.SpanExporter, error)
 		return exp, nil
 
 	default:
-		// Spans go to STDERR, not stdout.
-		//
-		// stdout carries the structured application logs, and a log pipeline
-		// parses every line as JSON. Span JSON has a completely different shape
-		// and would be ingested as malformed log records. Keeping the two
-		// streams separate means `make logs` stays readable and neither
-		// pipeline has to know about the other.
 		return stdouttrace.New(
 			stdouttrace.WithWriter(stderrWriter()),
 			stdouttrace.WithPrettyPrint(),
